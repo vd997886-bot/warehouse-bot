@@ -1,12 +1,19 @@
 import os
 import re
+import difflib
 import pandas as pd
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 
-# ========== НАСТРОЙКИ ==========
-TOKEN = os.getenv("TOKEN")  # добавь в Railway Variables: TOKEN=...
+# ========== SETTINGS ==========
+TOKEN = os.getenv("TOKEN")  # set in Railway Variables
 FILE_PATH = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = {
@@ -19,7 +26,7 @@ REQUIRED_COLUMNS = {
     "SerialNumber",
     "Check",
 }
-# ===============================
+# ==============================
 
 
 def normalize_text(v) -> str:
@@ -29,29 +36,104 @@ def normalize_text(v) -> str:
 
 
 def to_yes(v) -> bool:
-    v = normalize_text(v).lower()
-    return v in {"yes", "y", "true", "1", "да", "ok", "checked"}
+    s = normalize_text(v).lower()
+    return s in {"yes", "y", "true", "1", "да", "ok", "checked", "есть"}
 
 
-def normalize_query(s: str) -> str:
-    """Нормализация для 'похожего' поиска: убираем пробелы/дефисы/слэши, приводим к lower."""
-    s = (s or "").strip().lower()
-    s = s.replace("—", "-").replace("–", "-")
-    s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[-_/\\]+", "", s)
+def normalize_part_for_search(s: str) -> str:
+    """
+    Делает поиск "похожего" лучше:
+    - нижний регистр
+    - убирает пробелы, дефисы, слеши, точки
+    """
+    s = normalize_text(s).lower()
+    s = re.sub(r"[ \t\r\n\-\._/\\]+", "", s)
     return s
+
+
+def safe_int(v) -> int:
+    try:
+        if pd.isna(v):
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
+
+
+def fmt_row(row) -> str:
+    part = normalize_text(row["PartNumber"])
+    qty = safe_int(row["Quantity"])
+    shelf = normalize_text(row["Shelf"])
+    location = normalize_text(row["Location"])
+
+    passport = "есть" if to_yes(row["Passport"]) else "нет"
+
+    cat_raw = normalize_text(row["Category"]).lower()
+    if cat_raw in {"new", "нова", "новая"}:
+        category = "новая"
+    elif cat_raw in {"old", "стара", "старая"}:
+        category = "старая"
+    else:
+        category = normalize_text(row["Category"]) or "—"
+
+    serial = normalize_text(row["SerialNumber"]) or "—"
+    checked = "проверена" if to_yes(row["Check"]) else "не проверена"
+
+    if qty > 0:
+        return (
+            f"✅ {part} есть в наличии\n"
+            f"📦 Полка: {shelf}, ячейка: {location}\n"
+            f"🔢 Количество: {qty}\n"
+            f"📄 Паспорт: {passport}\n"
+            f"🆕 Категория: {category}\n"
+            f"🔑 Серийный номер: {serial}\n"
+            f"✔️ Проверка: {checked}"
+        )
+    else:
+        return (
+            f"❌ {part} нет в наличии\n"
+            f"📄 Паспорт: {passport}\n"
+            f"🆕 Категория: {category}\n"
+            f"🔑 Серийный номер: {serial}\n"
+            f"✔️ Проверка: {checked}"
+        )
+
+
+def load_df():
+    if not os.path.exists(FILE_PATH):
+        raise FileNotFoundError(
+            f"Файл {FILE_PATH} не найден. Пришли его боту в Telegram как .xlsx"
+        )
+
+    df = pd.read_excel(FILE_PATH)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if not REQUIRED_COLUMNS.issubset(set(df.columns)):
+        missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
+        raise ValueError("В Excel не хватает колонок: " + ", ".join(missing))
+
+    # готовим строковые поля
+    df["PartNumber"] = df["PartNumber"].astype(str)
+    df["_pn_norm"] = df["PartNumber"].apply(normalize_part_for_search)
+    return df
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Напиши part number (или часть), и я найду.\n"
-        "Чтобы обновить таблицу: отправь .xlsx файлом в этот чат (или /update)."
+        "Привет 👋\n"
+        "Напиши PartNumber (или часть номера) — я найду.\n"
+        "Чтобы обновить базу — пришли Excel файлом (.xlsx) сюда в чат."
     )
 
 
-async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["awaiting_file"] = True
-    await update.message.reply_text("Ок, пришли Excel (.xlsx) файлом сюда — я обновлю warehouse.xlsx ✅")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — старт\n"
+        "/help — помощь\n\n"
+        "1) Поиск: просто отправь PartNumber или часть\n"
+        "2) Обновление: отправь .xlsx файлом — я заменю warehouse.xlsx"
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,148 +141,79 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc:
         return
 
-    filename = (doc.file_name or "").lower()
-
-    # принимаем только xlsx
-    if not filename.endswith(".xlsx"):
-        await update.message.reply_text("Пришли именно Excel файл .xlsx")
+    name = doc.file_name or ""
+    if not name.lower().endswith(".xlsx"):
+        await update.message.reply_text("❌ Пришли именно Excel файл (.xlsx)")
         return
 
-    # если хочешь строго только по /update, раскомментируй:
-    # if not context.user_data.get("awaiting_file"):
-    #     await update.message.reply_text("Если хочешь обновить таблицу — напиши /update и затем пришли файл.")
-    #     return
+    # скачиваем и заменяем warehouse.xlsx
+    tg_file = await context.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(FILE_PATH)
 
+    # быстрая проверка что файл норм читается и колонки есть
     try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        tmp_path = "warehouse_upload.xlsx"
-        await tg_file.download_to_drive(custom_path=tmp_path)
-
-        # проверим что файл читается и колонки на месте
-        df = pd.read_excel(tmp_path)
-        df.columns = [str(c).strip() for c in df.columns]
-
-        if not REQUIRED_COLUMNS.issubset(set(df.columns)):
-            missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
-            await update.message.reply_text(
-                "❌ В файле не хватает колонок:\n" + ", ".join(missing) + "\n\nНичего не обновила."
-            )
-            os.remove(tmp_path)
-            return
-
-        # заменить основной файл
-        if os.path.exists(FILE_PATH):
-            os.remove(FILE_PATH)
-        os.rename(tmp_path, FILE_PATH)
-
-        context.user_data["awaiting_file"] = False
-        await update.message.reply_text(f"✅ Таблица обновлена! Строк: {len(df)}")
-
+        _ = load_df()
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Не смогла обновить файл: {e}")
+        await update.message.reply_text(f"⚠️ Файл скачался, но есть ошибка:\n{e}")
+        return
+
+    await update.message.reply_text("✅ Таблица обновлена! Теперь можно искать.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = (update.message.text or "").strip()
-    if not query:
+    text = (update.message.text or "").strip()
+    if not text:
         return
 
-    if not os.path.exists(FILE_PATH):
-        await update.message.reply_text("⚠️ Таблица не найдена на сервере. Пришли warehouse.xlsx файлом сюда.")
-        return
+    query_raw = text
+    query_norm = normalize_part_for_search(query_raw)
 
     try:
-        df = pd.read_excel(FILE_PATH)
-        df.columns = [str(c).strip() for c in df.columns]
-
-        if not REQUIRED_COLUMNS.issubset(set(df.columns)):
-            missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
-            await update.message.reply_text("❌ В Excel не хватает колонок:\n" + ", ".join(missing))
-            return
-
-        # подготовка к "похожему" поиску
-        df["PartNumber"] = df["PartNumber"].astype(str)
-        df["_pn_norm"] = df["PartNumber"].map(normalize_query)
-
-        q_norm = normalize_query(query)
-
-        # 1) строгий contains по нормализованному
-        matches = df[df["_pn_norm"].str.contains(q_norm, na=False)]
-
-        # 2) если ничего — попробуем обычный contains (на случай если запрос с дефисами)
-        if matches.empty:
-            matches = df[df["PartNumber"].str.lower().str.contains(query.lower(), na=False)]
-
-        if matches.empty:
-            await update.message.reply_text("❓ Не нашла такую запчасть в таблице")
-            return
-
-        responses = []
-        for _, row in matches.head(10).iterrows():  # ограничим, чтобы не спамило
-            part = normalize_text(row["PartNumber"])
-
-            try:
-                qty = int(float(row["Quantity"])) if not pd.isna(row["Quantity"]) else 0
-            except Exception:
-                qty = 0
-
-            shelf = normalize_text(row["Shelf"])
-            location = normalize_text(row["Location"])
-
-            passport = "есть" if to_yes(row["Passport"]) else "нет"
-
-            cat_raw = normalize_text(row["Category"]).lower()
-            category = "новая" if cat_raw == "new" else ("старая" if cat_raw else "—")
-
-            serial = normalize_text(row["SerialNumber"]) or "—"
-
-            checked = "проверена" if to_yes(row["Check"]) else "не проверена"
-
-            if qty > 0:
-                responses.append(
-                    f"✅ {part} есть в наличии\n"
-                    f"📦 Полка: {shelf}, ячейка: {location}\n"
-                    f"🔢 Количество: {qty}\n"
-                    f"📄 Паспорт: {passport}\n"
-                    f"🆕 Категория: {category}\n"
-                    f"🔑 Серийный номер: {serial}\n"
-                    f"✔️ Проверка: {checked}"
-                )
-            else:
-                responses.append(
-                    f"❌ {part} нет в наличии\n"
-                    f"📄 Паспорт: {passport}\n"
-                    f"🆕 Категория: {category}\n"
-                    f"🔑 Серийный номер: {serial}\n"
-                    f"✔️ Проверка: {checked}"
-                )
-
-        extra = ""
-        if len(matches) > 10:
-            extra = f"\n\nℹ️ Нашла {len(matches)} совпадений, показала первые 10."
-
-        await update.message.reply_text("\n\n".join(responses) + extra)
-
+        df = load_df()
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
+        return
+
+    # 1) Точное/частичное совпадение (по нормализованному номеру)
+    exact = df[df["_pn_norm"].str.contains(query_norm, na=False)]
+
+    # если есть — отдаем
+    if not exact.empty:
+        responses = [fmt_row(row) for _, row in exact.iterrows()]
+        await update.message.reply_text("\n\n".join(responses[:20]))
+        if len(responses) > 20:
+            await update.message.reply_text("ℹ️ Нашла много совпадений, показала первые 20.")
+        return
+
+    # 2) Fuzzy поиск (похожее)
+    pn_list = df["_pn_norm"].tolist()
+    close = difflib.get_close_matches(query_norm, pn_list, n=8, cutoff=0.6)
+
+    if close:
+        fuzzy = df[df["_pn_norm"].isin(close)]
+        responses = [fmt_row(row) for _, row in fuzzy.iterrows()]
+        await update.message.reply_text(
+            "🤔 Точного совпадения нет, но нашла похожие:\n\n" + "\n\n".join(responses)
+        )
+        return
+
+    await update.message.reply_text("❓ Ничего не нашла по этому запросу")
 
 
 def main():
     if not TOKEN:
-        raise RuntimeError("TOKEN is missing. Add TOKEN in Railway Variables.")
+        raise RuntimeError("TOKEN не задан. Добавь TOKEN в Railway Variables.")
 
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("update", update_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    # документ (xlsx)
+    # ВАЖНО: сначала документы, потом текст
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # текстовый поиск
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 warehouse bot started")
+    print("🤖 Warehouse bot started")
     app.run_polling(drop_pending_updates=True)
 
 

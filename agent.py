@@ -1,16 +1,10 @@
 import os
 import pandas as pd
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# ===== НАСТРОЙКИ =====
-TOKEN = os.getenv("TOKEN")  # токен ТОЛЬКО через Railway Variables
+# ========= НАСТРОЙКИ =========
+TOKEN = os.getenv("TOKEN")
 EXCEL_FILE = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = {
@@ -23,21 +17,21 @@ REQUIRED_COLUMNS = {
     "SerialNumber",
     "Check",
 }
-# ====================
+# ==============================
 
 
-def normalize(v) -> str:
+def normalize(v):
     if pd.isna(v):
         return ""
     return str(v).strip()
 
 
-def is_yes(v) -> bool:
+def to_yes(v):
     return normalize(v).lower() in {"yes", "y", "true", "1", "да", "ok", "checked"}
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = (update.message.text or "").strip().lower()
+    query = (update.message.text or "").strip()
     if not query:
         return
 
@@ -45,7 +39,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = pd.read_excel(EXCEL_FILE)
         df.columns = [str(c).strip() for c in df.columns]
 
-        # проверка колонок
         if not REQUIRED_COLUMNS.issubset(df.columns):
             missing = REQUIRED_COLUMNS - set(df.columns)
             await update.message.reply_text(
@@ -54,51 +47,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         df["PartNumber"] = df["PartNumber"].astype(str)
-
-        # 🔍 ПОИСК ПОХОЖИХ (contains)
-        matches = df[df["PartNumber"].str.lower().str.contains(query, na=False)]
+        matches = df[df["PartNumber"].str.lower().str.contains(query.lower(), na=False)]
 
         if matches.empty:
-            await update.message.reply_text("❓ Такой запчасти нет")
+            await update.message.reply_text("❌ Ничего не найдено")
             return
 
-        answers = []
+        replies = []
 
         for _, row in matches.iterrows():
-            part = normalize(row["PartNumber"])
+            qty = int(float(row["Quantity"])) if not pd.isna(row["Quantity"]) else 0
 
-            try:
-                qty = int(float(row["Quantity"]))
-            except Exception:
-                qty = 0
+            replies.append(
+                f"{'✅' if qty > 0 else '❌'} {normalize(row['PartNumber'])}\n"
+                f"📦 Полка: {normalize(row['Shelf'])}, ячейка: {normalize(row['Location'])}\n"
+                f"🔢 Количество: {qty}\n"
+                f"📄 Паспорт: {'есть' if to_yes(row['Passport']) else 'нет'}\n"
+                f"🆕 Категория: {'новая' if normalize(row['Category']).lower() == 'new' else 'старая'}\n"
+                f"🔑 Серийный номер: {normalize(row['SerialNumber']) or '—'}\n"
+                f"✔️ Проверка: {'проверена' if to_yes(row['Check']) else 'не проверена'}"
+            )
 
-            shelf = normalize(row["Shelf"])
-            location = normalize(row["Location"])
-            passport = "есть" if is_yes(row["Passport"]) else "нет"
-            category = "новая" if normalize(row["Category"]).lower() == "new" else "старая"
-            serial = normalize(row["SerialNumber"]) or "—"
-            checked = "проверена" if is_yes(row["Check"]) else "не проверена"
-
-            if qty > 0:
-                answers.append(
-                    f"✅ {part}\n"
-                    f"📦 Полка: {shelf}, ячейка: {location}\n"
-                    f"🔢 Количество: {qty}\n"
-                    f"📄 Паспорт: {passport}\n"
-                    f"🆕 Категория: {category}\n"
-                    f"🔑 Серийный номер: {serial}\n"
-                    f"✔️ Проверка: {checked}"
-                )
-            else:
-                answers.append(
-                    f"❌ {part} — нет в наличии\n"
-                    f"📄 Паспорт: {passport}\n"
-                    f"🆕 Категория: {category}\n"
-                    f"🔑 Серийный номер: {serial}\n"
-                    f"✔️ Проверка: {checked}"
-                )
-
-        await update.message.reply_text("\n\n".join(answers))
+        await update.message.reply_text("\n\n".join(replies))
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
@@ -106,11 +76,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TOKEN:
-        raise RuntimeError("TOKEN не найден в переменных окружения")
+        raise ValueError("TOKEN is not set")
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Warehouse bot запущен")
     app.run_polling()
 
 

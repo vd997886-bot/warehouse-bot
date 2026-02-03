@@ -1,12 +1,14 @@
+import os
+import re
 import pandas as pd
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 
-# ========== НАСТРОЙКИ ==========
-TOKEN = "8551566060:AAEo59Y05sJhJGgRPi8onehAV9-0h04_JOs"   # <-- вставь сюда свой токен
-FILE_PATH = "warehouse.xlsx"      # файл должен лежать рядом с agent.py
+# ================= НАСТРОЙКИ =================
+TOKEN = os.getenv("TOKEN")          # Токен ТОЛЬКО из Railway Variables
+FILE_PATH = "warehouse.xlsx"        # Excel лежит рядом с agent.py
 
 REQUIRED_COLUMNS = {
     "PartNumber",
@@ -18,7 +20,7 @@ REQUIRED_COLUMNS = {
     "SerialNumber",
     "Check",
 }
-# ===============================
+# =============================================
 
 
 def normalize_text(v) -> str:
@@ -32,26 +34,49 @@ def to_yes(v: str) -> bool:
     return v in {"yes", "y", "true", "1", "да", "ok", "checked"}
 
 
+def normalize_pn(v: str) -> str:
+    if pd.isna(v):
+        return ""
+    v = str(v).lower()
+    v = re.sub(r"[^a-z0-9]", "", v)  # убираем дефисы, пробелы, символы
+    return v
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = (update.message.text or "").strip()
-    if not query:
+    query_raw = (update.message.text or "").strip()
+    if not query_raw:
         return
 
     try:
-        df = pd.read_excel(FILE_PATH)
+        # Читаем Excel
+        df = pd.read_excel(FILE_PATH, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
 
         # Проверка колонок
         if not REQUIRED_COLUMNS.issubset(set(df.columns)):
             missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
             await update.message.reply_text(
-                "❌ Ошибка: в Excel не хватает колонок:\n" + ", ".join(missing)
+                "❌ В Excel не хватает колонок:\n" + ", ".join(missing)
             )
             return
 
-        # Поиск по PartNumber
+        # Подготовка для умного поиска
         df["PartNumber"] = df["PartNumber"].astype(str)
-        matches = df[df["PartNumber"].str.lower().str.contains(query.lower(), na=False)]
+        df["pn_norm"] = df["PartNumber"].apply(normalize_pn)
+
+        query_norm = normalize_pn(query_raw)
+
+        # УМНЫЙ ПОИСК (похожие номера)
+        matches = df[df["pn_norm"].str.contains(query_norm, na=False)]
+
+        # Если совсем ничего — пробуем по частям
+        if matches.empty:
+            parts = [p for p in re.split(r"[-\s]", query_raw) if p]
+            if parts:
+                mask = False
+                for p in parts:
+                    mask = mask | df["PartNumber"].str.contains(p, case=False, na=False)
+                matches = df[mask]
 
         if matches.empty:
             await update.message.reply_text("❓ Такой запчасти нет в таблице")
@@ -71,19 +96,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shelf = normalize_text(row["Shelf"])
             location = normalize_text(row["Location"])
 
-            # Passport: yes/no -> есть/нет
             passport = "есть" if to_yes(row["Passport"]) else "нет"
 
-            # Category: new/old -> новая/старая
             cat_raw = normalize_text(row["Category"]).lower()
             category = "новая" if cat_raw == "new" else "старая"
 
-            # SerialNumber
-            serial = normalize_text(row["SerialNumber"])
-            if serial == "":
-                serial = "—"
-
-            # Check: yes -> проверена, иначе не проверена
+            serial = normalize_text(row["SerialNumber"]) or "—"
             checked = "проверена" if to_yes(row["Check"]) else "не проверена"
 
             if qty > 0:

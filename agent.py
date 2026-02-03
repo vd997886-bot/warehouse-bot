@@ -1,14 +1,17 @@
 import os
-import re
 import pandas as pd
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-
-# ================= НАСТРОЙКИ =================
-TOKEN = os.getenv("TOKEN")          # Токен ТОЛЬКО из Railway Variables
-FILE_PATH = "warehouse.xlsx"        # Excel лежит рядом с agent.py
+# ===== НАСТРОЙКИ =====
+TOKEN = os.getenv("TOKEN")  # токен ТОЛЬКО через Railway Variables
+EXCEL_FILE = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = {
     "PartNumber",
@@ -20,93 +23,65 @@ REQUIRED_COLUMNS = {
     "SerialNumber",
     "Check",
 }
-# =============================================
+# ====================
 
 
-def normalize_text(v) -> str:
+def normalize(v) -> str:
     if pd.isna(v):
         return ""
     return str(v).strip()
 
 
-def to_yes(v: str) -> bool:
-    v = normalize_text(v).lower()
-    return v in {"yes", "y", "true", "1", "да", "ok", "checked"}
-
-
-def normalize_pn(v: str) -> str:
-    if pd.isna(v):
-        return ""
-    v = str(v).lower()
-    v = re.sub(r"[^a-z0-9]", "", v)  # убираем дефисы, пробелы, символы
-    return v
+def is_yes(v) -> bool:
+    return normalize(v).lower() in {"yes", "y", "true", "1", "да", "ok", "checked"}
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_raw = (update.message.text or "").strip()
-    if not query_raw:
+    query = (update.message.text or "").strip().lower()
+    if not query:
         return
 
     try:
-        # Читаем Excel
-        df = pd.read_excel(FILE_PATH, dtype=str)
+        df = pd.read_excel(EXCEL_FILE)
         df.columns = [str(c).strip() for c in df.columns]
 
-        # Проверка колонок
-        if not REQUIRED_COLUMNS.issubset(set(df.columns)):
-            missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
+        # проверка колонок
+        if not REQUIRED_COLUMNS.issubset(df.columns):
+            missing = REQUIRED_COLUMNS - set(df.columns)
             await update.message.reply_text(
                 "❌ В Excel не хватает колонок:\n" + ", ".join(missing)
             )
             return
 
-        # Подготовка для умного поиска
         df["PartNumber"] = df["PartNumber"].astype(str)
-        df["pn_norm"] = df["PartNumber"].apply(normalize_pn)
 
-        query_norm = normalize_pn(query_raw)
-
-        # УМНЫЙ ПОИСК (похожие номера)
-        matches = df[df["pn_norm"].str.contains(query_norm, na=False)]
-
-        # Если совсем ничего — пробуем по частям
-        if matches.empty:
-            parts = [p for p in re.split(r"[-\s]", query_raw) if p]
-            if parts:
-                mask = False
-                for p in parts:
-                    mask = mask | df["PartNumber"].str.contains(p, case=False, na=False)
-                matches = df[mask]
+        # 🔍 ПОИСК ПОХОЖИХ (contains)
+        matches = df[df["PartNumber"].str.lower().str.contains(query, na=False)]
 
         if matches.empty:
-            await update.message.reply_text("❓ Такой запчасти нет в таблице")
+            await update.message.reply_text("❓ Такой запчасти нет")
             return
 
-        responses = []
+        answers = []
 
         for _, row in matches.iterrows():
-            part = normalize_text(row["PartNumber"])
+            part = normalize(row["PartNumber"])
 
-            # Quantity
             try:
-                qty = int(float(row["Quantity"])) if not pd.isna(row["Quantity"]) else 0
+                qty = int(float(row["Quantity"]))
             except Exception:
                 qty = 0
 
-            shelf = normalize_text(row["Shelf"])
-            location = normalize_text(row["Location"])
-
-            passport = "есть" if to_yes(row["Passport"]) else "нет"
-
-            cat_raw = normalize_text(row["Category"]).lower()
-            category = "новая" if cat_raw == "new" else "старая"
-
-            serial = normalize_text(row["SerialNumber"]) or "—"
-            checked = "проверена" if to_yes(row["Check"]) else "не проверена"
+            shelf = normalize(row["Shelf"])
+            location = normalize(row["Location"])
+            passport = "есть" if is_yes(row["Passport"]) else "нет"
+            category = "новая" if normalize(row["Category"]).lower() == "new" else "старая"
+            serial = normalize(row["SerialNumber"]) or "—"
+            checked = "проверена" if is_yes(row["Check"]) else "не проверена"
 
             if qty > 0:
-                responses.append(
-                    f"✅ {part} есть в наличии\n"
+                answers.append(
+                    f"✅ {part}\n"
                     f"📦 Полка: {shelf}, ячейка: {location}\n"
                     f"🔢 Количество: {qty}\n"
                     f"📄 Паспорт: {passport}\n"
@@ -115,25 +90,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✔️ Проверка: {checked}"
                 )
             else:
-                responses.append(
-                    f"❌ {part} нет в наличии\n"
+                answers.append(
+                    f"❌ {part} — нет в наличии\n"
                     f"📄 Паспорт: {passport}\n"
                     f"🆕 Категория: {category}\n"
                     f"🔑 Серийный номер: {serial}\n"
                     f"✔️ Проверка: {checked}"
                 )
 
-        await update.message.reply_text("\n\n".join(responses))
+        await update.message.reply_text("\n\n".join(answers))
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("TOKEN не найден в переменных окружения")
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Avacs Stock Bot запущен")
-    app.run_polling(drop_pending_updates=True)
+    print("🤖 Warehouse bot запущен")
+    app.run_polling()
 
 
 if __name__ == "__main__":

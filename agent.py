@@ -25,6 +25,7 @@ REQUIRED_COLUMNS = {
     "Category",
     "SerialNumber",
     "Check",
+    "Price",   # ✅ добавили цену
 }
 # ==============================
 
@@ -60,6 +61,26 @@ def safe_int(v) -> int:
         return 0
 
 
+def fmt_price(v) -> str:
+    """
+    Красиво показывает цену:
+    - пусто -> "—"
+    - число -> без .0
+    """
+    if pd.isna(v):
+        return "—"
+    s = str(v).strip()
+    if not s:
+        return "—"
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+        return str(f)
+    except Exception:
+        return s
+
+
 def fmt_row(row) -> str:
     part = normalize_text(row["PartNumber"])
     qty = safe_int(row["Quantity"])
@@ -79,6 +100,8 @@ def fmt_row(row) -> str:
     serial = normalize_text(row["SerialNumber"]) or "—"
     checked = "проверена" if to_yes(row["Check"]) else "не проверена"
 
+    price = fmt_price(row["Price"])  # ✅ цена
+
     if qty > 0:
         return (
             f"✅ {part} есть в наличии\n"
@@ -86,6 +109,7 @@ def fmt_row(row) -> str:
             f"🔢 Количество: {qty}\n"
             f"📄 Паспорт: {passport}\n"
             f"🆕 Категория: {category}\n"
+            f"💰 Цена: {price}\n"          # ✅ добавили
             f"🔑 Серийный номер: {serial}\n"
             f"✔️ Проверка: {checked}"
         )
@@ -94,6 +118,7 @@ def fmt_row(row) -> str:
             f"❌ {part} нет в наличии\n"
             f"📄 Паспорт: {passport}\n"
             f"🆕 Категория: {category}\n"
+            f"💰 Цена: {price}\n"          # ✅ добавили
             f"🔑 Серийный номер: {serial}\n"
             f"✔️ Проверка: {checked}"
         )
@@ -217,5 +242,5 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # ✅ важно: именно так
     main()

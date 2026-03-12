@@ -12,11 +12,11 @@ from telegram.ext import (
     filters,
 )
 
-# ========== SETTINGS ==========
+# ========= SETTINGS =========
 TOKEN = os.getenv("TOKEN")  # set in Railway Variables
 FILE_PATH = "warehouse.xlsx"
 
-REQUIRED_COLUMNS = {
+REQUIRED_COLUMNS = [
     "PartNumber",
     "Quantity",
     "Shelf",
@@ -25,129 +25,90 @@ REQUIRED_COLUMNS = {
     "Category",
     "SerialNumber",
     "Check",
-    "Price",   # ✅ добавили цену
-}
-# ==============================
+    "Price",
+    "Photo",   # <- добавили колонку для фото
+]
 
 
-def normalize_text(v) -> str:
-    if pd.isna(v):
+# ========= HELPERS =========
+def normalize_part_for_search(value: str) -> str:
+    if value is None:
         return ""
-    return str(v).strip()
+    value = str(value).strip().upper()
+    value = re.sub(r"[\s\-_./\\]+", "", value)
+    return value
 
 
-def to_yes(v) -> bool:
-    s = normalize_text(v).lower()
-    return s in {"yes", "y", "true", "1", "да", "ok", "checked", "есть"}
+def safe_str(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
-def normalize_part_for_search(s: str) -> str:
-    """
-    Делает поиск "похожего" лучше:
-    - нижний регистр
-    - убирает пробелы, дефисы, слеши, точки
-    """
-    s = normalize_text(s).lower()
-    s = re.sub(r"[ \t\r\n\-\._/\\]+", "", s)
-    return s
-
-
-def safe_int(v) -> int:
-    try:
-        if pd.isna(v):
-            return 0
-        return int(float(v))
-    except Exception:
-        return 0
-
-
-def fmt_price(v) -> str:
-    """
-    Красиво показывает цену:
-    - пусто -> "—"
-    - число -> без .0
-    """
-    if pd.isna(v):
-        return "—"
-    s = str(v).strip()
-    if not s:
-        return "—"
-    try:
-        f = float(s)
-        if f.is_integer():
-            return str(int(f))
-        return str(f)
-    except Exception:
-        return s
-
-
-def fmt_row(row) -> str:
-    part = normalize_text(row["PartNumber"])
-    qty = safe_int(row["Quantity"])
-    shelf = normalize_text(row["Shelf"])
-    location = normalize_text(row["Location"])
-
-    passport = "есть" if to_yes(row["Passport"]) else "нет"
-
-    cat_raw = normalize_text(row["Category"]).lower()
-    if cat_raw in {"new", "нова", "новая"}:
-        category = "новая"
-    elif cat_raw in {"old", "стара", "старая"}:
-        category = "старая"
-    else:
-        category = normalize_text(row["Category"]) or "—"
-
-    serial = normalize_text(row["SerialNumber"]) or "—"
-    checked = "проверена" if to_yes(row["Check"]) else "не проверена"
-
-    price = fmt_price(row["Price"])  # ✅ цена
-
-    if qty > 0:
-        return (
-            f"✅ {part} есть в наличии\n"
-            f"📦 Полка: {shelf}, ячейка: {location}\n"
-            f"🔢 Количество: {qty}\n"
-            f"📄 Паспорт: {passport}\n"
-            f"🆕 Категория: {category}\n"
-            f"💰 Цена: {price}\n"          # ✅ добавили
-            f"🔑 Серийный номер: {serial}\n"
-            f"✔️ Проверка: {checked}"
-        )
-    else:
-        return (
-            f"❌ {part} нет в наличии\n"
-            f"📄 Паспорт: {passport}\n"
-            f"🆕 Категория: {category}\n"
-            f"💰 Цена: {price}\n"          # ✅ добавили
-            f"🔑 Серийный номер: {serial}\n"
-            f"✔️ Проверка: {checked}"
-        )
-
-
-def load_df():
+def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
-            f"Файл {FILE_PATH} не найден. Пришли его боту в Telegram как .xlsx"
+            f"Файл {FILE_PATH} не найден. Пришли .xlsx файлом в бота, чтобы загрузить таблицу."
         )
 
     df = pd.read_excel(FILE_PATH)
-    df.columns = [str(c).strip() for c in df.columns]
 
-    if not REQUIRED_COLUMNS.issubset(set(df.columns)):
-        missing = sorted(list(REQUIRED_COLUMNS - set(df.columns)))
-        raise ValueError("В Excel не хватает колонок: " + ", ".join(missing))
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(
+            "В Excel не хватает колонок:\n" + ", ".join(missing)
+        )
 
-    # готовим строковые поля
     df["PartNumber"] = df["PartNumber"].astype(str)
     df["_pn_norm"] = df["PartNumber"].apply(normalize_part_for_search)
+
     return df
 
 
+def fmt_row(row) -> str:
+    part_number = safe_str(row.get("PartNumber"))
+    quantity = safe_str(row.get("Quantity"))
+    shelf = safe_str(row.get("Shelf"))
+    location = safe_str(row.get("Location"))
+    passport = safe_str(row.get("Passport"))
+    category = safe_str(row.get("Category"))
+    serial_number = safe_str(row.get("SerialNumber"))
+    check = safe_str(row.get("Check"))
+    price = safe_str(row.get("Price"))
+
+    return (
+        f"🔹 PartNumber: {part_number}\n"
+        f"📦 Quantity: {quantity}\n"
+        f"🗄 Shelf: {shelf}\n"
+        f"📍 Location: {location}\n"
+        f"📄 Passport: {passport}\n"
+        f"🏷 Category: {category}\n"
+        f"🔢 SerialNumber: {serial_number}\n"
+        f"✅ Check: {check}\n"
+        f"💵 Price: {price}"
+    )
+
+
+async def send_row(update: Update, row):
+    caption = fmt_row(row)
+    photo = safe_str(row.get("Photo"))
+
+    if photo and photo.lower() != "nan":
+        try:
+            await update.message.reply_photo(photo=photo, caption=caption)
+            return
+        except Exception:
+            pass
+
+    await update.message.reply_text(caption)
+
+
+# ========= COMMANDS =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет 👋\n"
-        "Напиши PartNumber (или часть номера) — я найду.\n"
-        "Чтобы обновить базу — пришли Excel файлом (.xlsx) сюда в чат."
+        "Привет! 👋\n\n"
+        "Просто отправь номер детали или часть номера.\n"
+        "Также можешь отправить новый Excel .xlsx файлом, и я обновлю базу."
     )
 
 
@@ -157,10 +118,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — старт\n"
         "/help — помощь\n\n"
         "1) Поиск: просто отправь PartNumber или часть\n"
-        "2) Обновление: отправь .xlsx файлом — я заменю warehouse.xlsx"
+        "2) Обновление: отправь .xlsx файлом — я заменю warehouse.xlsx\n\n"
+        "Важно: в Excel должна быть колонка Photo со ссылкой на фото."
     )
 
 
+# ========= FILE UPLOAD =========
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
@@ -171,11 +134,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пришли именно Excel файл (.xlsx)")
         return
 
-    # скачиваем и заменяем warehouse.xlsx
     tg_file = await context.bot.get_file(doc.file_id)
     await tg_file.download_to_drive(FILE_PATH)
 
-    # быстрая проверка что файл норм читается и колонки есть
     try:
         _ = load_df()
     except Exception as e:
@@ -185,6 +146,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Таблица обновлена! Теперь можно искать.")
 
 
+# ========= SEARCH =========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -199,32 +161,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
         return
 
-    # 1) Точное/частичное совпадение (по нормализованному номеру)
+    # 1) Точное/частичное совпадение
     exact = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
-    # если есть — отдаем
     if not exact.empty:
-        responses = [fmt_row(row) for _, row in exact.iterrows()]
-        await update.message.reply_text("\n\n".join(responses[:20]))
-        if len(responses) > 20:
-            await update.message.reply_text("ℹ️ Нашла много совпадений, показала первые 20.")
+        shown = 0
+        for _, row in exact.head(10).iterrows():
+            await send_row(update, row)
+            shown += 1
+
+        if len(exact) > 10:
+            await update.message.reply_text("ℹ️ Нашла много совпадений, показала первые 10.")
         return
 
-    # 2) Fuzzy поиск (похожее)
-    pn_list = df["_pn_norm"].tolist()
+    # 2) Fuzzy поиск
+    pn_list = df["_pn_norm"].dropna().tolist()
     close = difflib.get_close_matches(query_norm, pn_list, n=8, cutoff=0.6)
 
     if close:
         fuzzy = df[df["_pn_norm"].isin(close)]
-        responses = [fmt_row(row) for _, row in fuzzy.iterrows()]
-        await update.message.reply_text(
-            "🤔 Точного совпадения нет, но нашла похожие:\n\n" + "\n\n".join(responses)
-        )
+
+        await update.message.reply_text("🤔 Точного совпадения нет, но нашла похожие:")
+
+        for _, row in fuzzy.iterrows():
+            await send_row(update, row)
         return
 
     await update.message.reply_text("❓ Ничего не нашла по этому запросу")
 
 
+# ========= MAIN =========
 def main():
     if not TOKEN:
         raise RuntimeError("TOKEN не задан. Добавь TOKEN в Railway Variables.")
@@ -234,7 +200,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
-    # ВАЖНО: сначала документы, потом текст
+    # сначала документы, потом текст
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -242,5 +208,5 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":  # ✅ важно: именно так
+if __name__ == "__main__":
     main()

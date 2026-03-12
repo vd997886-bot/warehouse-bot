@@ -47,6 +47,34 @@ def safe_str(value) -> str:
     return str(value).strip()
 
 
+def translate_value(value, field):
+    v = safe_str(value).lower()
+
+    if field == "passport":
+        if v in ["yes", "y", "true", "1"]:
+            return "есть"
+        if v in ["no", "n", "false", "0"]:
+            return "нет"
+
+    if field == "check":
+        if v in ["yes", "y", "true", "1"]:
+            return "проверена"
+        if v in ["no", "n", "false", "0"]:
+            return "не проверена"
+
+    if field == "category":
+        if v == "new":
+            return "новая"
+        if v == "used":
+            return "б/у"
+        if v == "serviceable":
+            return "исправная"
+        if v == "overhauled":
+            return "после ремонта"
+
+    return safe_str(value)
+
+
 def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
@@ -71,10 +99,12 @@ def fmt_row(row) -> str:
     qty = safe_str(row.get("Quantity"))
     shelf = safe_str(row.get("Shelf"))
     location = safe_str(row.get("Location"))
-    passport = safe_str(row.get("Passport"))
-    category = safe_str(row.get("Category"))
+
+    passport = translate_value(row.get("Passport"), "passport")
+    category = translate_value(row.get("Category"), "category")
+    check = translate_value(row.get("Check"), "check")
+
     serial = safe_str(row.get("SerialNumber"))
-    check = safe_str(row.get("Check"))
     price = safe_str(row.get("Price"))
 
     if not price:

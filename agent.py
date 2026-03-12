@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 # ========= SETTINGS =========
-TOKEN = os.getenv("TOKEN")  # set in Railway Variables
+TOKEN = os.getenv("TOKEN")
 FILE_PATH = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = [
@@ -26,7 +26,7 @@ REQUIRED_COLUMNS = [
     "SerialNumber",
     "Check",
     "Price",
-    "Photo",   # <- добавили колонку для фото
+    "Photo",
 ]
 
 
@@ -45,6 +45,26 @@ def safe_str(value) -> str:
     return str(value).strip()
 
 
+def normalize_photo_link(photo: str) -> str:
+    """
+    Делает из обычной ссылки Google Drive рабочую ссылку для Telegram.
+    Если ссылка уже нормальная или это не Google Drive — возвращает как есть.
+    """
+    photo = safe_str(photo)
+
+    if not photo:
+        return ""
+
+    if "drive.google.com/file/d/" in photo:
+        try:
+            file_id = photo.split("/d/")[1].split("/")[0]
+            return f"https://drive.google.com/uc?export=view&id={file_id}"
+        except Exception:
+            return photo
+
+    return photo
+
+
 def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
@@ -53,11 +73,12 @@ def load_df() -> pd.DataFrame:
 
     df = pd.read_excel(FILE_PATH)
 
+    # убираем лишние пробелы из названий колонок
+    df.columns = [str(col).strip() for col in df.columns]
+
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing:
-        raise ValueError(
-            "В Excel не хватает колонок:\n" + ", ".join(missing)
-        )
+        raise ValueError("В Excel не хватает колонок:\n" + ", ".join(missing))
 
     df["PartNumber"] = df["PartNumber"].astype(str)
     df["_pn_norm"] = df["PartNumber"].apply(normalize_part_for_search)
@@ -66,34 +87,38 @@ def load_df() -> pd.DataFrame:
 
 
 def fmt_row(row) -> str:
-    part_number = safe_str(row.get("PartNumber"))
-    quantity = safe_str(row.get("Quantity"))
+    part = safe_str(row.get("PartNumber"))
+    qty = safe_str(row.get("Quantity"))
     shelf = safe_str(row.get("Shelf"))
     location = safe_str(row.get("Location"))
     passport = safe_str(row.get("Passport"))
     category = safe_str(row.get("Category"))
-    serial_number = safe_str(row.get("SerialNumber"))
+    serial = safe_str(row.get("SerialNumber"))
     check = safe_str(row.get("Check"))
     price = safe_str(row.get("Price"))
 
+    if not price:
+        price = "—"
+    if not check:
+        check = "не проверена"
+
     return (
-        f"🔹 PartNumber: {part_number}\n"
-        f"📦 Quantity: {quantity}\n"
-        f"🗄 Shelf: {shelf}\n"
-        f"📍 Location: {location}\n"
-        f"📄 Passport: {passport}\n"
-        f"🏷 Category: {category}\n"
-        f"🔢 SerialNumber: {serial_number}\n"
-        f"✅ Check: {check}\n"
-        f"💵 Price: {price}"
+        f"✅ {part} есть в наличии\n"
+        f"📦 Полка: {shelf}, ячейка: {location}\n"
+        f"🔢 Количество: {qty}\n"
+        f"📄 Паспорт: {passport}\n"
+        f"🆕 Категория: {category}\n"
+        f"💰 Цена: {price}\n"
+        f"🔑 Серийный номер: {serial}\n"
+        f"✔ Проверка: {check}"
     )
 
 
 async def send_row(update: Update, row):
     caption = fmt_row(row)
-    photo = safe_str(row.get("Photo"))
+    photo = normalize_photo_link(row.get("Photo"))
 
-    if photo and photo.lower() != "nan":
+    if photo:
         try:
             await update.message.reply_photo(photo=photo, caption=caption)
             return
@@ -108,7 +133,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! 👋\n\n"
         "Просто отправь номер детали или часть номера.\n"
-        "Также можешь отправить новый Excel .xlsx файлом, и я обновлю базу."
+        "Если хочешь обновить базу — отправь Excel файл .xlsx."
     )
 
 
@@ -117,9 +142,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start — старт\n"
         "/help — помощь\n\n"
-        "1) Поиск: просто отправь PartNumber или часть\n"
+        "1) Поиск: просто отправь PartNumber или часть номера\n"
         "2) Обновление: отправь .xlsx файлом — я заменю warehouse.xlsx\n\n"
-        "Важно: в Excel должна быть колонка Photo со ссылкой на фото."
+        "Важно: в Excel должны быть колонки:\n"
+        "PartNumber, Quantity, Shelf, Location, Passport, Category, SerialNumber, Check, Price, Photo"
     )
 
 
@@ -152,8 +178,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    query_raw = text
-    query_norm = normalize_part_for_search(query_raw)
+    query_norm = normalize_part_for_search(text)
 
     try:
         df = load_df()
@@ -161,20 +186,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
         return
 
-    # 1) Точное/частичное совпадение
+    # 1) точное / частичное совпадение
     exact = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
     if not exact.empty:
-        shown = 0
-        for _, row in exact.head(10).iterrows():
-            await send_row(update, row)
-            shown += 1
+        rows = list(exact.iterrows())
 
-        if len(exact) > 10:
+        for _, row in rows[:10]:
+            await send_row(update, row)
+
+        if len(rows) > 10:
             await update.message.reply_text("ℹ️ Нашла много совпадений, показала первые 10.")
         return
 
-    # 2) Fuzzy поиск
+    # 2) похожие
     pn_list = df["_pn_norm"].dropna().tolist()
     close = difflib.get_close_matches(query_norm, pn_list, n=8, cutoff=0.6)
 

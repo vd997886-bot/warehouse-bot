@@ -13,8 +13,9 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("TOKEN")
-FILE_PATH = "warehouse.xlsx"
+FILE_PATH = "/app/warehouse.xlsx"
 PHOTO_CHANNEL_ID = -1003423652656
+PHOTO_DB_PATH = "/app/data/photo_index.json"
 
 REQUIRED_COLUMNS = [
     "PartNumber",

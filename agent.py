@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import difflib
 import pandas as pd
 
@@ -81,14 +82,11 @@ def clean_serial(value) -> str:
 
 def clean_price(value) -> str:
     price = safe_str(value)
+
     if not price or price in ["/", "-", "—"]:
         return "—"
 
-    price = price.replace("USD", "$").replace("usd", "$")
-    price = price.strip()
-
-    if price.endswith("$"):
-        return price
+    price = price.replace("USD", "$").replace("usd", "$").strip()
     return price
 
 
@@ -136,30 +134,68 @@ def fmt_row(row) -> str:
     )
 
 
-async def get_photo_from_channel(context: ContextTypes.DEFAULT_TYPE, part_number: str):
-    """
-    ВАЖНО:
-    Обычный Telegram-бот не умеет нормально читать всю историю канала как человек,
-    поэтому этот способ может не сработать стабильно.
-    Оставляю как пробный вариант.
-    """
-    try:
-        chat = await context.bot.get_chat(PHOTO_CHANNEL_ID)
-        print("photo channel found:", chat.title)
-    except Exception as e:
-        print("cannot access photo channel:", e)
-        return None
+def load_photo_index() -> dict:
+    if not os.path.exists(PHOTO_DB_PATH):
+        return {}
 
-    # Здесь Telegram Bot API не дает простого способа искать старые сообщения канала по подписи.
-    # Поэтому пока возвращаем None.
-    return None
+    try:
+        with open(PHOTO_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_photo_index(data: dict):
+    os.makedirs(os.path.dirname(PHOTO_DB_PATH), exist_ok=True)
+    with open(PHOTO_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def index_channel_photo(message):
+    """
+    Если в канал пришло фото с подписью, например:
+    ИД-3
+    или
+    ИД-3 датчик
+    бот сохранит связь:
+    нормализованный номер -> file_id
+    """
+    if message.chat_id != PHOTO_CHANNEL_ID:
+        return
+
+    if not message.photo:
+        return
+
+    caption = (message.caption or "").strip()
+    if not caption:
+        return
+
+    # Берем первую строку подписи как ключ
+    first_line = caption.splitlines()[0].strip()
+    if not first_line:
+        return
+
+    part_norm = normalize_part_for_search(first_line)
+    if not part_norm:
+        return
+
+    file_id = message.photo[-1].file_id
+
+    index = load_photo_index()
+    index[part_norm] = file_id
+    save_photo_index(index)
+
+    print(f"Saved photo index: {first_line} -> {part_norm}")
 
 
 async def send_part_response(update: Update, context: ContextTypes.DEFAULT_TYPE, row):
     caption = fmt_row(row)
     part_number = safe_str(row.get("PartNumber"))
+    part_norm = normalize_part_for_search(part_number)
 
-    photo_file_id = await get_photo_from_channel(context, part_number)
+    photo_index = load_photo_index()
+    photo_file_id = photo_index.get(part_norm)
 
     if photo_file_id:
         try:
@@ -175,7 +211,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! 👋\n\n"
         "Просто отправь номер детали или часть номера.\n"
-        "Чтобы обновить базу — отправь Excel файл .xlsx."
+        "Чтобы обновить базу — отправь Excel файл .xlsx.\n\n"
+        "Фото я беру из канала с фото деталей."
     )
 
 
@@ -186,7 +223,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — помощь\n\n"
         "Поиск работает так:\n"
         "просто отправь номер детали или часть номера.\n"
-        "Чтобы обновить базу — отправь Excel файл .xlsx."
+        "Чтобы обновить базу — отправь Excel файл .xlsx.\n\n"
+        "Чтобы фото появилось в боте:\n"
+        "отправь фото в канал AVACS PART PHOTOS с подписью номера детали."
     )
 
 
@@ -259,6 +298,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Ничего не нашла по этому запросу")
 
 
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.channel_post:
+        await index_channel_photo(update.channel_post)
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("TOKEN не задан. Добавь TOKEN в Railway Variables.")
@@ -269,6 +313,10 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Ловим новые посты в канале
+    app.add_handler(MessageHandler(filters.Chat(chat_id=PHOTO_CHANNEL_ID) & filters.PHOTO, handle_channel_post))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.PHOTO, handle_channel_post))
 
     print("🤖 Warehouse bot started")
     app.run_polling(drop_pending_updates=True)

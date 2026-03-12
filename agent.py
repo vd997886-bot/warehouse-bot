@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import difflib
 import pandas as pd
 
@@ -14,9 +13,7 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("TOKEN")
-FILE_PATH = "/app/warehouse.xlsx"
-PHOTO_CHANNEL_ID = -1003423652656
-PHOTO_DB_PATH = "/app/data/photo_index.json"
+FILE_PATH = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = [
     "PartNumber",
@@ -28,6 +25,7 @@ REQUIRED_COLUMNS = [
     "SerialNumber",
     "Check",
     "Price",
+    "PhotoID",
 ]
 
 
@@ -134,72 +132,13 @@ def fmt_row(row) -> str:
     )
 
 
-def load_photo_index() -> dict:
-    if not os.path.exists(PHOTO_DB_PATH):
-        return {}
-
-    try:
-        with open(PHOTO_DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_photo_index(data: dict):
-    os.makedirs(os.path.dirname(PHOTO_DB_PATH), exist_ok=True)
-    with open(PHOTO_DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-async def index_channel_photo(message):
-    """
-    Если в канал пришло фото с подписью, например:
-    ИД-3
-    или
-    ИД-3 датчик
-    бот сохранит связь:
-    нормализованный номер -> file_id
-    """
-    if message.chat_id != PHOTO_CHANNEL_ID:
-        return
-
-    if not message.photo:
-        return
-
-    caption = (message.caption or "").strip()
-    if not caption:
-        return
-
-    # Берем первую строку подписи как ключ
-    first_line = caption.splitlines()[0].strip()
-    if not first_line:
-        return
-
-    part_norm = normalize_part_for_search(first_line)
-    if not part_norm:
-        return
-
-    file_id = message.photo[-1].file_id
-
-    index = load_photo_index()
-    index[part_norm] = file_id
-    save_photo_index(index)
-
-    print(f"Saved photo index: {first_line} -> {part_norm}")
-
-
-async def send_part_response(update: Update, context: ContextTypes.DEFAULT_TYPE, row):
+async def send_part_response(update: Update, row):
     caption = fmt_row(row)
-    part_number = safe_str(row.get("PartNumber"))
-    part_norm = normalize_part_for_search(part_number)
+    photo_id = safe_str(row.get("PhotoID"))
 
-    photo_index = load_photo_index()
-    photo_file_id = photo_index.get(part_norm)
-
-    if photo_file_id:
+    if photo_id:
         try:
-            await update.message.reply_photo(photo=photo_file_id, caption=caption)
+            await update.message.reply_photo(photo=photo_id, caption=caption)
             return
         except Exception as e:
             print("reply_photo error:", e)
@@ -212,7 +151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! 👋\n\n"
         "Просто отправь номер детали или часть номера.\n"
         "Чтобы обновить базу — отправь Excel файл .xlsx.\n\n"
-        "Фото я беру из канала с фото деталей."
+        "Если хочешь добавить фото:\n"
+        "просто отправь мне фотографию, и я пришлю PhotoID."
     )
 
 
@@ -221,11 +161,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/start — старт\n"
         "/help — помощь\n\n"
-        "Поиск работает так:\n"
-        "просто отправь номер детали или часть номера.\n"
-        "Чтобы обновить базу — отправь Excel файл .xlsx.\n\n"
-        "Чтобы фото появилось в боте:\n"
-        "отправь фото в канал AVACS PART PHOTOS с подписью номера детали."
+        "Поиск:\n"
+        "просто отправь номер детали или часть номера.\n\n"
+        "Обновление базы:\n"
+        "отправь Excel файл .xlsx\n\n"
+        "Фото:\n"
+        "отправь боту фотографию, и я пришлю PhotoID.\n"
+        "Потом вставь этот PhotoID в колонку PhotoID в Excel."
     )
 
 
@@ -251,6 +193,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Таблица обновлена! Теперь можно искать.")
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        return
+
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+
+    await update.message.reply_text(
+        f"PhotoID:\n{file_id}\n\nСкопируй это и вставь в колонку PhotoID в Excel."
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -269,7 +223,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not exact_only.empty:
         row = exact_only.iloc[0]
-        await send_part_response(update, context, row)
+        await send_part_response(update, row)
         return
 
     # 2) частичное совпадение
@@ -298,11 +252,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Ничего не нашла по этому запросу")
 
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.channel_post:
-        await index_channel_photo(update.channel_post)
-
-
 def main():
     if not TOKEN:
         raise RuntimeError("TOKEN не задан. Добавь TOKEN в Railway Variables.")
@@ -312,11 +261,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Ловим новые посты в канале
-    app.add_handler(MessageHandler(filters.Chat(chat_id=PHOTO_CHANNEL_ID) & filters.PHOTO, handle_channel_post))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.PHOTO, handle_channel_post))
 
     print("🤖 Warehouse bot started")
     app.run_polling(drop_pending_updates=True)

@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
-    CommandHandler, 
+    CommandHandler,
     ContextTypes,
     filters,
 )
@@ -132,16 +132,21 @@ def fmt_row(row) -> str:
     )
 
 
-async def send_part_response(update: Update, row):
+async def send_part_response(update: Update, context: ContextTypes.DEFAULT_TYPE, row):
     caption = fmt_row(row)
-    photo_id = safe_str(row.get("PhotoID"))
+    photo_id = str(row.get("PhotoID", "")).strip()
 
-    if photo_id:
+    print("PHOTO_ID:", photo_id)
+
+    if photo_id and photo_id.lower() != "nan":
         try:
-            await update.message.reply_photo(photo=photo_id, caption=caption)
+            await update.message.reply_photo(
+                photo=photo_id,
+                caption=caption
+            )
             return
         except Exception as e:
-            print("reply_photo error:", e)
+            print("PHOTO ERROR:", e)
 
     await update.message.reply_text(caption)
 
@@ -223,7 +228,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not exact_only.empty:
         row = exact_only.iloc[0]
-        await send_part_response(update, row)
+        await send_part_response(update, context, row)
         return
 
     # 2) частичное совпадение

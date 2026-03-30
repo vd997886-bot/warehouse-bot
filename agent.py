@@ -235,11 +235,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partial = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
     if not partial.empty:
+        # если нашёлся ровно 1 вариант — отправляем как точное
+        if len(partial) == 1:
+            row = partial.iloc[0]
+            await send_part_response(update, context, row)
+            return
+
+        # если вариантов несколько — показываем списком
         responses = [fmt_row(row) for _, row in partial.head(3).iterrows()]
         msg = "\n\n".join(responses)
 
         if len(partial) > 3:
             msg += "\n\nℹ️ Нашла несколько вариантов, показала первые 3."
+
         await update.message.reply_text(msg)
         return
 

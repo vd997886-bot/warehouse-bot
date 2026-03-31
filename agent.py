@@ -227,38 +227,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exact_only = df[df["_pn_norm"] == query_norm]
 
     if not exact_only.empty:
-        row = exact_only.iloc[0]
-        await send_part_response(update, context, row)
+        # если точных совпадений несколько — показываем первые 10
+        if len(exact_only) == 1:
+            row = exact_only.iloc[0]
+            await send_part_response(update, context, row)
+            return
+
+        responses = [fmt_row(row) for _, row in exact_only.head(10).iterrows()]
+        msg = "\n\n".join(responses)
+
+        if len(exact_only) > 10:
+            msg += "\n\nℹ️ Нашла несколько одинаковых позиций, показала первые 10."
+
+        await update.message.reply_text(msg)
         return
 
     # 2) частичное совпадение
     partial = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
     if not partial.empty:
-        # если нашёлся ровно 1 вариант — отправляем как точное
+        # если нашёлся ровно 1 вариант — отправляем как одиночный результат
         if len(partial) == 1:
             row = partial.iloc[0]
             await send_part_response(update, context, row)
             return
 
-        # если вариантов несколько — показываем списком
-        responses = [fmt_row(row) for _, row in partial.head(3).iterrows()]
+        responses = [fmt_row(row) for _, row in partial.head(10).iterrows()]
         msg = "\n\n".join(responses)
 
-        if len(partial) > 3:
-            msg += "\n\nℹ️ Нашла несколько вариантов, показала первые 3."
+        if len(partial) > 10:
+            msg += "\n\nℹ️ Нашла несколько вариантов, показала первые 10."
 
         await update.message.reply_text(msg)
         return
 
     # 3) похожие
     pn_list = df["_pn_norm"].dropna().tolist()
-    close = difflib.get_close_matches(query_norm, pn_list, n=3, cutoff=0.75)
+    close = difflib.get_close_matches(query_norm, pn_list, n=10, cutoff=0.75)
 
     if close:
         fuzzy = df[df["_pn_norm"].isin(close)]
-        responses = [fmt_row(row) for _, row in fuzzy.head(3).iterrows()]
+        responses = [fmt_row(row) for _, row in fuzzy.head(10).iterrows()]
         msg = "🤔 Точного совпадения нет, но нашла похожие:\n\n" + "\n\n".join(responses)
+
+        if len(fuzzy) > 10:
+            msg += "\n\nℹ️ Показала первые 10."
+
         await update.message.reply_text(msg)
         return
 

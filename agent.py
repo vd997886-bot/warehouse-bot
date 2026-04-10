@@ -91,6 +91,17 @@ def clean_price(value) -> str:
     return price
 
 
+def clean_date(value) -> str:
+    if pd.isna(value):
+        return ""
+
+    try:
+        dt = pd.to_datetime(value)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(value).split(" ")[0]
+
+
 def qty_to_number(qty_value) -> float:
     qty = safe_str(qty_value).replace(",", ".")
     try:
@@ -132,12 +143,11 @@ def fmt_row(row) -> str:
     price = clean_price(row.get("Price"))
 
     sold_to = safe_str(row.get("SoldTo"))
-    sold_date = safe_str(row.get("SoldDate"))
+    sold_date = clean_date(row.get("SoldDate"))
     notes = safe_str(row.get("Notes"))
 
     qty_num = qty_to_number(row.get("Quantity"))
 
-    # если продано
     if qty_num <= 0:
         text = (
             f"❌ ПРОДАНО\n"
@@ -160,7 +170,6 @@ def fmt_row(row) -> str:
 
         return text
 
-    # если в наличии
     return (
         f"✅ {part} есть в наличии\n"
         f"📦 Полка: {shelf}, ячейка: {location}\n"
@@ -181,10 +190,7 @@ async def send_part_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if photo_id and photo_id.lower() != "nan":
         try:
-            await update.message.reply_photo(
-                photo=photo_id,
-                caption=caption
-            )
+            await update.message.reply_photo(photo=photo_id, caption=caption)
             return
         except Exception as e:
             print("PHOTO ERROR:", e)
@@ -264,7 +270,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
         return
 
-    # 1) точное совпадение
     exact_only = df[df["_pn_norm"] == query_norm]
 
     if not exact_only.empty:
@@ -282,7 +287,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # 2) частичное совпадение
     partial = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
     if not partial.empty:
@@ -300,7 +304,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # 3) похожие
     pn_list = df["_pn_norm"].dropna().tolist()
     close = difflib.get_close_matches(query_norm, pn_list, n=10, cutoff=0.75)
 

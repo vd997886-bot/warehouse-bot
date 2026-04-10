@@ -26,6 +26,9 @@ REQUIRED_COLUMNS = [
     "Check",
     "Price",
     "PhotoID",
+    "SoldTo",
+    "SoldDate",
+    "Notes",
 ]
 
 
@@ -88,6 +91,14 @@ def clean_price(value) -> str:
     return price
 
 
+def qty_to_number(qty_value) -> float:
+    qty = safe_str(qty_value).replace(",", ".")
+    try:
+        return float(qty)
+    except Exception:
+        return 0.0
+
+
 def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
@@ -120,6 +131,36 @@ def fmt_row(row) -> str:
     serial = clean_serial(row.get("SerialNumber"))
     price = clean_price(row.get("Price"))
 
+    sold_to = safe_str(row.get("SoldTo"))
+    sold_date = safe_str(row.get("SoldDate"))
+    notes = safe_str(row.get("Notes"))
+
+    qty_num = qty_to_number(row.get("Quantity"))
+
+    # если продано
+    if qty_num <= 0:
+        text = (
+            f"❌ ПРОДАНО\n"
+            f"📦 {part}\n"
+            f"📍 Полка: {shelf}, ячейка: {location}\n"
+            f"🔢 Количество: {qty}\n"
+            f"📄 Паспорт: {passport}\n"
+            f"🆕 Категория: {category}\n"
+            f"💰 Цена: {price}\n"
+            f"🔑 Серийный номер: {serial}\n"
+            f"✔ Проверка: {check}"
+        )
+
+        if sold_to:
+            text += f"\n👤 Кому продано: {sold_to}"
+        if sold_date:
+            text += f"\n📅 Дата продажи: {sold_date}"
+        if notes:
+            text += f"\n📝 Заметка: {notes}"
+
+        return text
+
+    # если в наличии
     return (
         f"✅ {part} есть в наличии\n"
         f"📦 Полка: {shelf}, ячейка: {location}\n"
@@ -227,7 +268,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exact_only = df[df["_pn_norm"] == query_norm]
 
     if not exact_only.empty:
-        # если точных совпадений несколько — показываем первые 10
         if len(exact_only) == 1:
             row = exact_only.iloc[0]
             await send_part_response(update, context, row)
@@ -246,7 +286,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partial = df[df["_pn_norm"].str.contains(query_norm, na=False)]
 
     if not partial.empty:
-        # если нашёлся ровно 1 вариант — отправляем как одиночный результат
         if len(partial) == 1:
             row = partial.iloc[0]
             await send_part_response(update, context, row)

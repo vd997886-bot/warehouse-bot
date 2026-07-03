@@ -1,1 +1,2 @@
-[settings] pethon.github_attestations = false
+[settings]
+python.github_attestations = false

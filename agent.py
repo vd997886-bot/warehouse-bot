@@ -7,7 +7,12 @@ from datetime import datetime
 
 import pandas as pd
 from openpyxl import load_workbook
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -20,10 +25,6 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = "warehouse.xlsx"
-
-# Необязательно.
-# Можно добавить в Railway переменную ADMIN_ID со своим Telegram ID.
-# Тогда удалять строки и загружать новый Excel сможете только вы.
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 REQUIRED_COLUMNS = [
@@ -42,27 +43,39 @@ REQUIRED_COLUMNS = [
     "Notes",
 ]
 
-# Защищает Excel от одновременного изменения несколькими командами.
 excel_lock = asyncio.Lock()
 
 
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [
+            "🔍 Найти запчасть",
+            "🗑 Удалить запчасть",
+        ],
+        [
+            "↩️ Отменить удаление",
+            "❌ Отмена",
+        ],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
 def is_authorized(user_id: int) -> bool:
-    """
-    Если ADMIN_ID не задан — бот разрешает изменения всем.
-    Если ADMIN_ID задан — изменения доступны только этому пользователю.
-    """
     if not ADMIN_ID:
         return True
 
     return str(user_id) == str(ADMIN_ID)
 
 
-def normalize_part_for_search(value: str) -> str:
+def normalize_part_for_search(value) -> str:
     if value is None:
         return ""
 
     value = str(value).strip().upper()
     value = re.sub(r"[\s\-_./\\]+", "", value)
+
     return value
 
 
@@ -74,28 +87,33 @@ def safe_str(value) -> str:
 
 
 def translate_value(value, field):
-    v = safe_str(value).lower()
+    value_text = safe_str(value).lower()
 
     if field == "passport":
-        if v in ["yes", "y", "true", "1"]:
+        if value_text in ["yes", "y", "true", "1"]:
             return "есть"
-        if v in ["no", "n", "false", "0"]:
+
+        if value_text in ["no", "n", "false", "0"]:
             return "нет"
 
     if field == "check":
-        if v in ["yes", "y", "true", "1"]:
+        if value_text in ["yes", "y", "true", "1"]:
             return "проверена"
-        if v in ["no", "n", "false", "0"]:
+
+        if value_text in ["no", "n", "false", "0"]:
             return "не проверена"
 
     if field == "category":
-        if v == "new":
+        if value_text == "new":
             return "новая"
-        if v == "used":
+
+        if value_text == "used":
             return "б/у"
-        if v == "serviceable":
+
+        if value_text == "serviceable":
             return "исправная"
-        if v == "overhauled":
+
+        if value_text == "overhauled":
             return "после ремонта"
 
     return safe_str(value)
@@ -116,8 +134,7 @@ def clean_price(value) -> str:
     if not price or price in ["/", "-", "—"]:
         return "—"
 
-    price = price.replace("USD", "$").replace("usd", "$").strip()
-    return price
+    return price.replace("USD", "$").replace("usd", "$").strip()
 
 
 def clean_date(value) -> str:
@@ -125,17 +142,19 @@ def clean_date(value) -> str:
         return ""
 
     try:
-        dt = pd.to_datetime(value)
-        return dt.strftime("%Y-%m-%d")
+        date_value = pd.to_datetime(value)
+        return date_value.strftime("%Y-%m-%d")
+
     except Exception:
         return str(value).split(" ")[0]
 
 
-def qty_to_number(qty_value) -> float:
-    qty = safe_str(qty_value).replace(",", ".")
+def qty_to_number(value) -> float:
+    quantity = safe_str(value).replace(",", ".")
 
     try:
-        return float(qty)
+        return float(quantity)
+
     except Exception:
         return 0.0
 
@@ -144,236 +163,344 @@ def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
             f"Файл {FILE_PATH} не найден. "
-            "Пришли .xlsx файлом в бота, чтобы загрузить таблицу."
+            "Пришли Excel .xlsx файлом в бота."
         )
 
-    df = pd.read_excel(FILE_PATH)
-    df.columns = [str(col).strip() for col in df.columns]
+    dataframe = pd.read_excel(FILE_PATH)
 
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    dataframe.columns = [
+        str(column).strip()
+        for column in dataframe.columns
+    ]
 
-    if missing:
+    missing_columns = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column not in dataframe.columns
+    ]
+
+    if missing_columns:
         raise ValueError(
-            "В Excel не хватает колонок:\n" + ", ".join(missing)
+            "В Excel не хватает колонок:\n"
+            + ", ".join(missing_columns)
         )
 
-    df["PartNumber"] = df["PartNumber"].astype(str)
-    df["_pn_norm"] = df["PartNumber"].apply(normalize_part_for_search)
+    dataframe["PartNumber"] = (
+        dataframe["PartNumber"]
+        .fillna("")
+        .astype(str)
+    )
 
-    return df
+    dataframe["_pn_norm"] = dataframe["PartNumber"].apply(
+        normalize_part_for_search
+    )
+
+    return dataframe
 
 
 def create_backup(prefix: str = "backup") -> str:
-    """
-    Создаёт резервную копию Excel рядом с warehouse.xlsx.
-    """
     if not os.path.exists(FILE_PATH):
-        raise FileNotFoundError(f"Файл {FILE_PATH} не найден.")
+        raise FileNotFoundError(
+            f"Файл {FILE_PATH} не найден."
+        )
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_path = f"warehouse_{prefix}_{timestamp}.xlsx"
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+
+    backup_path = (
+        f"warehouse_{prefix}_{timestamp}.xlsx"
+    )
 
     shutil.copy2(FILE_PATH, backup_path)
+
     return backup_path
 
 
 def get_excel_headers(workbook) -> dict:
-    """
-    Возвращает словарь:
-    название колонки -> номер колонки Excel.
-    """
-    sheet = workbook.active
+    worksheet = workbook.active
     headers = {}
 
-    for column_number, cell in enumerate(sheet[1], start=1):
+    for column_number, cell in enumerate(
+        worksheet[1],
+        start=1,
+    ):
         if cell.value is not None:
             headers[str(cell.value).strip()] = column_number
 
     return headers
 
 
-def get_rows_preview(row_numbers: list[int]) -> tuple[list[dict], list[int]]:
-    """
-    Проверяет номера строк и возвращает информацию о найденных позициях.
+def parse_part_numbers(text: str) -> list[str]:
+    text = text.strip()
 
-    Номера — именно те, которые видны слева в Excel.
-    Например, строка 2 — первая запчасть после заголовков.
-    """
+    if not text:
+        return []
+
+    parts = re.split(r"[,;\n]+", text)
+
+    cleaned_parts = []
+    normalized_seen = set()
+
+    for part in parts:
+        part = part.strip()
+
+        if not part:
+            continue
+
+        normalized = normalize_part_for_search(part)
+
+        if normalized and normalized not in normalized_seen:
+            normalized_seen.add(normalized)
+            cleaned_parts.append(part)
+
+    return cleaned_parts
+
+
+def find_rows_by_part_numbers(
+    requested_parts: list[str],
+) -> tuple[list[dict], list[str]]:
     if not os.path.exists(FILE_PATH):
-        raise FileNotFoundError(f"Файл {FILE_PATH} не найден.")
+        raise FileNotFoundError(
+            f"Файл {FILE_PATH} не найден."
+        )
 
-    workbook = load_workbook(FILE_PATH, data_only=False)
-    sheet = workbook.active
+    workbook = load_workbook(
+        FILE_PATH,
+        data_only=False,
+    )
+
+    worksheet = workbook.active
     headers = get_excel_headers(workbook)
 
     part_column = headers.get("PartNumber")
     serial_column = headers.get("SerialNumber")
     quantity_column = headers.get("Quantity")
+    shelf_column = headers.get("Shelf")
+    location_column = headers.get("Location")
 
     if not part_column:
         workbook.close()
-        raise ValueError("В Excel не найдена колонка PartNumber.")
 
+        raise ValueError(
+            "В Excel не найдена колонка PartNumber."
+        )
+
+    requested_map = {
+        normalize_part_for_search(part): part
+        for part in requested_parts
+    }
+
+    found_normalized = set()
     found_rows = []
-    invalid_rows = []
 
-    for row_number in sorted(set(row_numbers)):
-        if row_number < 2 or row_number > sheet.max_row:
-            invalid_rows.append(row_number)
-            continue
-
-        part_number = sheet.cell(
+    for row_number in range(2, worksheet.max_row + 1):
+        part_value = worksheet.cell(
             row=row_number,
             column=part_column,
         ).value
 
-        serial_number = ""
-        quantity = ""
+        normalized = normalize_part_for_search(
+            part_value
+        )
+
+        if normalized not in requested_map:
+            continue
+
+        found_normalized.add(normalized)
+
+        serial_value = ""
 
         if serial_column:
-            serial_number = sheet.cell(
+            serial_value = worksheet.cell(
                 row=row_number,
                 column=serial_column,
             ).value
 
+        quantity_value = ""
+
         if quantity_column:
-            quantity = sheet.cell(
+            quantity_value = worksheet.cell(
                 row=row_number,
                 column=quantity_column,
+            ).value
+
+        shelf_value = ""
+
+        if shelf_column:
+            shelf_value = worksheet.cell(
+                row=row_number,
+                column=shelf_column,
+            ).value
+
+        location_value = ""
+
+        if location_column:
+            location_value = worksheet.cell(
+                row=row_number,
+                column=location_column,
             ).value
 
         found_rows.append(
             {
                 "row": row_number,
-                "part_number": (
-                    str(part_number).strip()
-                    if part_number is not None
-                    else "Пустая строка"
-                ),
-                "serial_number": (
-                    str(serial_number).strip()
-                    if serial_number is not None
-                    else ""
-                ),
-                "quantity": (
-                    str(quantity).strip()
-                    if quantity is not None
-                    else ""
-                ),
+                "part_number": safe_str(part_value),
+                "normalized": normalized,
+                "serial_number": safe_str(serial_value),
+                "quantity": safe_str(quantity_value),
+                "shelf": safe_str(shelf_value),
+                "location": safe_str(location_value),
             }
         )
 
     workbook.close()
-    return found_rows, invalid_rows
+
+    not_found = []
+
+    for normalized, original in requested_map.items():
+        if normalized not in found_normalized:
+            not_found.append(original)
+
+    return found_rows, not_found
 
 
-def delete_excel_rows(row_numbers: list[int]) -> list[dict]:
-    """
-    Полностью удаляет строки из Excel.
-
-    Строки удаляются снизу вверх, поэтому номера не съезжают
-    во время удаления.
-    """
+def verify_pending_rows(
+    pending_rows: list[dict],
+) -> bool:
     if not os.path.exists(FILE_PATH):
-        raise FileNotFoundError(f"Файл {FILE_PATH} не найден.")
+        return False
 
-    workbook = load_workbook(FILE_PATH)
-    sheet = workbook.active
+    workbook = load_workbook(
+        FILE_PATH,
+        data_only=False,
+    )
+
+    worksheet = workbook.active
     headers = get_excel_headers(workbook)
-
     part_column = headers.get("PartNumber")
-    serial_column = headers.get("SerialNumber")
 
     if not part_column:
         workbook.close()
-        raise ValueError("В Excel не найдена колонка PartNumber.")
+        return False
 
-    deleted_items = []
+    for item in pending_rows:
+        row_number = item["row"]
 
-    # Обязательно удаляем от самой нижней строки к верхней.
-    for row_number in sorted(set(row_numbers), reverse=True):
-        if row_number < 2 or row_number > sheet.max_row:
-            continue
+        if row_number < 2 or row_number > worksheet.max_row:
+            workbook.close()
+            return False
 
-        part_number = sheet.cell(
+        current_part = worksheet.cell(
             row=row_number,
             column=part_column,
         ).value
 
-        serial_number = ""
-
-        if serial_column:
-            serial_number = sheet.cell(
-                row=row_number,
-                column=serial_column,
-            ).value
-
-        deleted_items.append(
-            {
-                "row": row_number,
-                "part_number": (
-                    str(part_number).strip()
-                    if part_number is not None
-                    else "Пустая строка"
-                ),
-                "serial_number": (
-                    str(serial_number).strip()
-                    if serial_number is not None
-                    else ""
-                ),
-            }
+        current_normalized = normalize_part_for_search(
+            current_part
         )
 
-        sheet.delete_rows(row_number, 1)
+        if current_normalized != item["normalized"]:
+            workbook.close()
+            return False
+
+    workbook.close()
+
+    return True
+
+
+def delete_excel_rows(
+    rows_to_delete: list[dict],
+) -> list[dict]:
+    if not os.path.exists(FILE_PATH):
+        raise FileNotFoundError(
+            f"Файл {FILE_PATH} не найден."
+        )
+
+    workbook = load_workbook(FILE_PATH)
+    worksheet = workbook.active
+
+    deleted_items = []
+
+    sorted_rows = sorted(
+        rows_to_delete,
+        key=lambda item: item["row"],
+        reverse=True,
+    )
+
+    for item in sorted_rows:
+        row_number = item["row"]
+
+        if row_number < 2 or row_number > worksheet.max_row:
+            continue
+
+        deleted_items.append(item)
+        worksheet.delete_rows(row_number, 1)
 
     workbook.save(FILE_PATH)
     workbook.close()
 
-    return sorted(deleted_items, key=lambda item: item["row"])
+    return sorted(
+        deleted_items,
+        key=lambda item: item["row"],
+    )
 
 
-def format_delete_preview(items: list[dict], invalid_rows: list[int]) -> str:
+def format_delete_preview(
+    found_rows: list[dict],
+    not_found: list[str],
+) -> str:
     lines = [
-        "⚠️ Будут полностью удалены следующие строки:",
+        "⚠️ Будут полностью удалены:",
         "",
     ]
 
-    # Чтобы сообщение не стало слишком длинным,
-    # показываем максимум первые 40 позиций.
-    shown_items = items[:40]
-
-    for item in shown_items:
-        line = f'{item["row"]} — {item["part_number"]}'
+    for item in found_rows[:40]:
+        line = f'📦 {item["part_number"]}'
 
         if item["serial_number"]:
-            line += f' | S/N: {item["serial_number"]}'
+            line += (
+                f' | S/N: {item["serial_number"]}'
+            )
 
         if item["quantity"]:
-            line += f' | Qty: {item["quantity"]}'
+            line += (
+                f' | Qty: {item["quantity"]}'
+            )
+
+        if item["shelf"]:
+            line += (
+                f' | Полка: {item["shelf"]}'
+            )
+
+        if item["location"]:
+            line += (
+                f' | Ячейка: {item["location"]}'
+            )
 
         lines.append(line)
 
-    if len(items) > 40:
+    if len(found_rows) > 40:
         lines.append("")
         lines.append(
-            f"…и ещё {len(items) - 40} позиций."
+            f"…и ещё {len(found_rows) - 40} строк."
         )
 
-    if invalid_rows:
+    if not_found:
         lines.append("")
-        lines.append(
-            "❌ Не существуют строки: "
-            + ", ".join(map(str, invalid_rows))
-        )
+        lines.append("❌ Не найдены:")
+
+        for part in not_found[:30]:
+            lines.append(f"• {part}")
 
     lines.append("")
     lines.append(
-        f"Всего будет удалено: {len(items)}"
+        f"Всего строк будет удалено: {len(found_rows)}"
     )
+
     lines.append("")
     lines.append(
-        "После удаления эти запчасти исчезнут из Excel "
-        "и больше не будут появляться в поиске."
+        "После удаления запчасти исчезнут "
+        "из Excel и из поиска бота."
     )
 
     return "\n".join(lines)
@@ -381,29 +508,55 @@ def format_delete_preview(items: list[dict], invalid_rows: list[int]) -> str:
 
 def fmt_row(row) -> str:
     part = safe_str(row.get("PartNumber"))
-    qty = safe_str(row.get("Quantity"))
+    quantity = safe_str(row.get("Quantity"))
     shelf = safe_str(row.get("Shelf"))
     location = safe_str(row.get("Location"))
 
-    passport = translate_value(row.get("Passport"), "passport")
-    category = translate_value(row.get("Category"), "category")
-    check = translate_value(row.get("Check"), "check")
+    passport = translate_value(
+        row.get("Passport"),
+        "passport",
+    )
 
-    serial = clean_serial(row.get("SerialNumber"))
-    price = clean_price(row.get("Price"))
+    category = translate_value(
+        row.get("Category"),
+        "category",
+    )
 
-    sold_to = safe_str(row.get("SoldTo"))
-    sold_date = clean_date(row.get("SoldDate"))
-    notes = safe_str(row.get("Notes"))
+    check = translate_value(
+        row.get("Check"),
+        "check",
+    )
 
-    qty_num = qty_to_number(row.get("Quantity"))
+    serial = clean_serial(
+        row.get("SerialNumber")
+    )
 
-    if qty_num <= 0:
+    price = clean_price(
+        row.get("Price")
+    )
+
+    sold_to = safe_str(
+        row.get("SoldTo")
+    )
+
+    sold_date = clean_date(
+        row.get("SoldDate")
+    )
+
+    notes = safe_str(
+        row.get("Notes")
+    )
+
+    quantity_number = qty_to_number(
+        row.get("Quantity")
+    )
+
+    if quantity_number <= 0:
         text = (
             f"❌ ПРОДАНО\n"
             f"📦 {part}\n"
             f"📍 Полка: {shelf}, ячейка: {location}\n"
-            f"🔢 Количество: {qty}\n"
+            f"🔢 Количество: {quantity}\n"
             f"📄 Паспорт: {passport}\n"
             f"🆕 Категория: {category}\n"
             f"💰 Цена: {price}\n"
@@ -412,20 +565,26 @@ def fmt_row(row) -> str:
         )
 
         if sold_to:
-            text += f"\n👤 Кому продано: {sold_to}"
+            text += (
+                f"\n👤 Кому продано: {sold_to}"
+            )
 
         if sold_date:
-            text += f"\n📅 Дата продажи: {sold_date}"
+            text += (
+                f"\n📅 Дата продажи: {sold_date}"
+            )
 
         if notes:
-            text += f"\n📝 Заметка: {notes}"
+            text += (
+                f"\n📝 Заметка: {notes}"
+            )
 
         return text
 
     return (
         f"✅ {part} есть в наличии\n"
         f"📦 Полка: {shelf}, ячейка: {location}\n"
-        f"🔢 Количество: {qty}\n"
+        f"🔢 Количество: {quantity}\n"
         f"📄 Паспорт: {passport}\n"
         f"🆕 Категория: {category}\n"
         f"💰 Цена: {price}\n"
@@ -440,9 +599,7 @@ async def send_part_response(
     row,
 ):
     caption = fmt_row(row)
-    photo_id = str(row.get("PhotoID", "")).strip()
-
-    print("PHOTO_ID:", photo_id)
+    photo_id = safe_str(row.get("PhotoID"))
 
     if photo_id and photo_id.lower() != "nan":
         try:
@@ -451,6 +608,7 @@ async def send_part_response(
                 caption=caption,
             )
             return
+
         except Exception as error:
             print("PHOTO ERROR:", error)
 
@@ -461,16 +619,12 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    context.user_data["mode"] = None
+
     await update.message.reply_text(
         "Привет! 👋\n\n"
-        "Просто отправь номер детали или часть номера.\n"
-        "Чтобы обновить базу — отправь Excel файл .xlsx.\n\n"
-        "Удаление проданных позиций:\n"
-        "/delete 58,73,102\n\n"
-        "Отмена последнего удаления:\n"
-        "/undo\n\n"
-        "Если хочешь добавить фото:\n"
-        "отправь мне фотографию, и я пришлю PhotoID."
+        "Выбери нужное действие кнопкой внизу.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -479,29 +633,32 @@ async def help_cmd(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
-        "Команды:\n\n"
-        "/start — старт\n"
-        "/help — помощь\n"
-        "/delete 58,73,102 — удалить строки Excel\n"
-        "/undo — отменить последнее удаление\n\n"
-        "Важно:\n"
-        "в /delete указываются номера строк, "
-        "которые видны слева в Excel.\n\n"
-        "Можно написать:\n"
-        "/delete 58,73,102\n\n"
-        "Или:\n"
-        "/delete 58 73 102\n\n"
-        "Поиск:\n"
-        "просто отправь номер детали или часть номера.\n\n"
-        "Обновление базы:\n"
-        "отправь Excel файл .xlsx.\n\n"
-        "Фото:\n"
-        "отправь боту фотографию, и я пришлю PhotoID.\n"
-        "Потом вставь PhotoID в колонку PhotoID в Excel."
+        "🔍 Найти запчасть — поиск по PartNumber.\n\n"
+        "🗑 Удалить запчасть — удалить одну "
+        "или несколько позиций по PartNumber.\n\n"
+        "↩️ Отменить удаление — восстановить "
+        "последнюю версию Excel.\n\n"
+        "Excel можно обновить, просто отправив "
+        "боту файл .xlsx.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-async def delete_cmd(
+async def begin_search_mode(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data["mode"] = "search"
+
+    await update.message.reply_text(
+        "🔍 Отправь PartNumber или часть номера.\n\n"
+        "Например:\n"
+        "ПУ-11",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def begin_delete_mode(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -509,77 +666,94 @@ async def delete_cmd(
 
     if not user or not is_authorized(user.id):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к удалению позиций."
+            "⛔ У вас нет доступа к удалению."
         )
         return
 
-    full_text = update.message.text or ""
+    context.user_data["mode"] = "delete"
 
-    # Убираем /delete или /delete@ИмяБота.
-    raw_values = re.sub(
-        r"^/delete(?:@\w+)?",
-        "",
-        full_text,
-        flags=re.IGNORECASE,
-    ).strip()
+    await update.message.reply_text(
+        "🗑 Отправь PartNumber, который нужно удалить.\n\n"
+        "Одну позицию:\n"
+        "ПУ-11\n\n"
+        "Несколько позиций:\n"
+        "ПУ-11, ЭЦН-333М, БПСР4",
+        reply_markup=MAIN_KEYBOARD,
+    )
 
-    if not raw_values:
+
+async def cancel_mode(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data["mode"] = None
+
+    context.user_data.pop(
+        "pending_delete_rows",
+        None,
+    )
+
+    await update.message.reply_text(
+        "❌ Действие отменено.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def prepare_delete(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+):
+    requested_parts = parse_part_numbers(text)
+
+    if not requested_parts:
         await update.message.reply_text(
-            "Напиши номера строк после команды.\n\n"
+            "❌ Не удалось прочитать PartNumber.\n\n"
             "Например:\n"
-            "/delete 58,73,102"
+            "ПУ-11, ЭЦН-333М"
         )
         return
 
-    # Разрешаем только цифры, пробелы, запятые и точки с запятой.
-    if not re.fullmatch(r"[\d,\s;]+", raw_values):
+    if len(requested_parts) > 500:
         await update.message.reply_text(
-            "❌ Неверный формат.\n\n"
-            "Используй только номера строк.\n"
-            "Например:\n"
-            "/delete 58,73,102"
-        )
-        return
-
-    row_numbers = [
-        int(number)
-        for number in re.findall(r"\d+", raw_values)
-    ]
-
-    # Удаляем повторяющиеся номера.
-    row_numbers = sorted(set(row_numbers))
-
-    if not row_numbers:
-        await update.message.reply_text(
-            "❌ Не удалось найти номера строк."
-        )
-        return
-
-    if len(row_numbers) > 500:
-        await update.message.reply_text(
-            "❌ За один раз можно удалить максимум 500 строк."
+            "❌ За один раз можно указать "
+            "максимум 500 PartNumber."
         )
         return
 
     try:
         async with excel_lock:
-            items, invalid_rows = get_rows_preview(row_numbers)
+            found_rows, not_found = (
+                find_rows_by_part_numbers(
+                    requested_parts
+                )
+            )
+
     except Exception as error:
         await update.message.reply_text(
             f"⚠️ Ошибка при чтении Excel:\n{error}"
         )
         return
 
-    if not items:
-        await update.message.reply_text(
-            "❌ Ни одной подходящей строки не найдено."
+    if not found_rows:
+        message = (
+            "❌ Ни одна запчасть не найдена.\n\n"
+            "Проверь написание PartNumber."
         )
+
+        if not_found:
+            message += "\n\nНе найдены:\n"
+            message += "\n".join(
+                f"• {part}"
+                for part in not_found[:30]
+            )
+
+        await update.message.reply_text(message)
         return
 
-    # Сохраняем список строк отдельно для каждого пользователя.
-    context.user_data["pending_delete_rows"] = [
-        item["row"] for item in items
-    ]
+    context.user_data["pending_delete_rows"] = (
+        found_rows
+    )
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -596,11 +770,44 @@ async def delete_cmd(
         ]
     )
 
-    preview_text = format_delete_preview(items, invalid_rows)
-
     await update.message.reply_text(
-        preview_text,
+        format_delete_preview(
+            found_rows,
+            not_found,
+        ),
         reply_markup=keyboard,
+    )
+
+
+async def delete_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if not user or not is_authorized(user.id):
+        await update.message.reply_text(
+            "⛔ У вас нет доступа к удалению."
+        )
+        return
+
+    command_text = update.message.text or ""
+
+    part_text = re.sub(
+        r"^/delete(?:@\w+)?",
+        "",
+        command_text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if not part_text:
+        await begin_delete_mode(update, context)
+        return
+
+    await prepare_delete(
+        update,
+        context,
+        part_text,
     )
 
 
@@ -619,62 +826,68 @@ async def delete_callback(
 
     if not is_authorized(user.id):
         await query.edit_message_text(
-            "⛔ У вас нет доступа к удалению позиций."
+            "⛔ У вас нет доступа к удалению."
         )
         return
 
-    action = query.data
+    if query.data == "cancel_delete":
+        context.user_data["mode"] = None
 
-    if action == "cancel_delete":
-        context.user_data.pop("pending_delete_rows", None)
+        context.user_data.pop(
+            "pending_delete_rows",
+            None,
+        )
 
         await query.edit_message_text(
             "❌ Удаление отменено. Excel не изменён."
         )
         return
 
-    if action != "confirm_delete":
+    if query.data != "confirm_delete":
         return
 
-    row_numbers = context.user_data.get("pending_delete_rows")
+    pending_rows = context.user_data.get(
+        "pending_delete_rows"
+    )
 
-    if not row_numbers:
+    if not pending_rows:
         await query.edit_message_text(
-            "⚠️ Список для удаления уже недействителен.\n"
-            "Отправь команду /delete ещё раз."
+            "⚠️ Список удаления уже недействителен.\n"
+            "Нажми кнопку «🗑 Удалить запчасть» ещё раз."
         )
         return
 
     try:
         async with excel_lock:
-            # Ещё раз проверяем строки прямо перед удалением.
-            current_items, invalid_rows = get_rows_preview(
-                row_numbers
-            )
-
-            if invalid_rows or len(current_items) != len(row_numbers):
+            if not verify_pending_rows(pending_rows):
                 context.user_data.pop(
                     "pending_delete_rows",
                     None,
                 )
 
+                context.user_data["mode"] = None
+
                 await query.edit_message_text(
-                    "⚠️ Excel изменился после команды /delete.\n"
-                    "Для безопасности удаление остановлено.\n\n"
-                    "Отправь команду /delete ещё раз."
+                    "⚠️ Excel изменился после поиска.\n"
+                    "Для безопасности удаление остановлено."
                 )
                 return
 
-            backup_path = create_backup("before_delete")
+            backup_path = create_backup(
+                "before_delete"
+            )
 
-            deleted_items = delete_excel_rows(row_numbers)
+            deleted_items = delete_excel_rows(
+                pending_rows
+            )
 
-            # Запоминаем последнюю резервную копию для /undo.
-            context.application.bot_data["last_backup"] = backup_path
-            context.application.bot_data["last_delete_user"] = user.id
             context.application.bot_data[
-                "last_deleted_items"
-            ] = deleted_items
+                "last_backup"
+            ] = backup_path
+
+            context.application.bot_data[
+                "last_delete_user"
+            ] = user.id
 
     except Exception as error:
         await query.edit_message_text(
@@ -682,38 +895,43 @@ async def delete_callback(
         )
         return
 
-    context.user_data.pop("pending_delete_rows", None)
+    context.user_data.pop(
+        "pending_delete_rows",
+        None,
+    )
+
+    context.user_data["mode"] = None
 
     lines = [
-        f"✅ Полностью удалено: {len(deleted_items)}",
+        f"✅ Полностью удалено строк: "
+        f"{len(deleted_items)}",
         "",
     ]
 
-    shown_items = deleted_items[:40]
-
-    for item in shown_items:
-        line = f'{item["row"]} — {item["part_number"]}'
+    for item in deleted_items[:40]:
+        line = f'• {item["part_number"]}'
 
         if item["serial_number"]:
-            line += f' | S/N: {item["serial_number"]}'
+            line += (
+                f' | S/N: {item["serial_number"]}'
+            )
 
         lines.append(line)
 
     if len(deleted_items) > 40:
         lines.append("")
         lines.append(
-            f"…и ещё {len(deleted_items) - 40} позиций."
+            f"…и ещё {len(deleted_items) - 40}."
         )
 
     lines.append("")
     lines.append(
         "Эти запчасти больше не находятся через поиск."
     )
-    lines.append(
-        "Для отмены последнего удаления отправь /undo."
-    )
 
-    await query.edit_message_text("\n".join(lines))
+    await query.edit_message_text(
+        "\n".join(lines)
+    )
 
 
 async def undo_cmd(
@@ -724,7 +942,7 @@ async def undo_cmd(
 
     if not user or not is_authorized(user.id):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к восстановлению Excel."
+            "⛔ У вас нет доступа к восстановлению."
         )
         return
 
@@ -732,43 +950,32 @@ async def undo_cmd(
         "last_backup"
     )
 
-    last_delete_user = context.application.bot_data.get(
-        "last_delete_user"
-    )
-
-    if not backup_path or not os.path.exists(backup_path):
-        await update.message.reply_text(
-            "❌ Нет последнего удаления, которое можно отменить."
-        )
-        return
-
-    if (
-        ADMIN_ID
-        and last_delete_user
-        and str(last_delete_user) != str(user.id)
+    if not backup_path or not os.path.exists(
+        backup_path
     ):
         await update.message.reply_text(
-            "❌ Последнее удаление сделал другой пользователь."
+            "❌ Нет последнего удаления, "
+            "которое можно отменить.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     try:
         async with excel_lock:
-            # Перед восстановлением тоже сохраняем текущую версию.
             create_backup("before_undo")
-            shutil.copy2(backup_path, FILE_PATH)
 
-            # Эту копию уже использовали.
+            shutil.copy2(
+                backup_path,
+                FILE_PATH,
+            )
+
             context.application.bot_data.pop(
                 "last_backup",
                 None,
             )
+
             context.application.bot_data.pop(
                 "last_delete_user",
-                None,
-            )
-            context.application.bot_data.pop(
-                "last_deleted_items",
                 None,
             )
 
@@ -778,9 +985,12 @@ async def undo_cmd(
         )
         return
 
+    context.user_data["mode"] = None
+
     await update.message.reply_text(
         "✅ Последнее удаление отменено.\n"
-        "Предыдущая версия warehouse.xlsx восстановлена."
+        "Предыдущая версия warehouse.xlsx восстановлена.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -796,44 +1006,50 @@ async def handle_document(
         )
         return
 
-    doc = update.message.document
+    document = update.message.document
 
-    if not doc:
+    if not document:
         return
 
-    name = doc.file_name or ""
+    file_name = document.file_name or ""
 
-    if not name.lower().endswith(".xlsx"):
+    if not file_name.lower().endswith(".xlsx"):
         await update.message.reply_text(
-            "❌ Пришли именно Excel файл (.xlsx)"
+            "❌ Пришли именно Excel файл .xlsx"
         )
         return
 
     temp_path = "warehouse_upload_temp.xlsx"
 
     try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        await tg_file.download_to_drive(temp_path)
+        telegram_file = await context.bot.get_file(
+            document.file_id
+        )
 
-        # Проверяем файл до того, как заменять рабочую базу.
-        test_df = pd.read_excel(temp_path)
-        test_df.columns = [
+        await telegram_file.download_to_drive(
+            temp_path
+        )
+
+        test_dataframe = pd.read_excel(temp_path)
+
+        test_dataframe.columns = [
             str(column).strip()
-            for column in test_df.columns
+            for column in test_dataframe.columns
         ]
 
-        missing = [
+        missing_columns = [
             column
             for column in REQUIRED_COLUMNS
-            if column not in test_df.columns
+            if column not in test_dataframe.columns
         ]
 
-        if missing:
-            os.remove(temp_path)
+        if missing_columns:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
             await update.message.reply_text(
-                "⚠️ В новом Excel не хватает колонок:\n"
-                + ", ".join(missing)
+                "⚠️ В Excel не хватает колонок:\n"
+                + ", ".join(missing_columns)
             )
             return
 
@@ -841,9 +1057,11 @@ async def handle_document(
             if os.path.exists(FILE_PATH):
                 create_backup("before_upload")
 
-            shutil.move(temp_path, FILE_PATH)
+            shutil.move(
+                temp_path,
+                FILE_PATH,
+            )
 
-        # Финальная проверка уже рабочего файла.
         load_df()
 
     except Exception as error:
@@ -854,12 +1072,15 @@ async def handle_document(
                 pass
 
         await update.message.reply_text(
-            f"⚠️ Не удалось загрузить таблицу:\n{error}"
+            f"⚠️ Не удалось загрузить Excel:\n{error}"
         )
         return
 
+    context.user_data["mode"] = None
+
     await update.message.reply_text(
-        "✅ Таблица обновлена! Теперь можно искать."
+        "✅ Таблица обновлена! Теперь можно искать.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -871,127 +1092,123 @@ async def handle_photo(
         return
 
     photo = update.message.photo[-1]
-    file_id = photo.file_id
 
     await update.message.reply_text(
-        f"PhotoID:\n{file_id}\n\n"
-        "Скопируй это и вставь в колонку PhotoID в Excel."
+        f"PhotoID:\n{photo.file_id}\n\n"
+        "Скопируй это и вставь "
+        "в колонку PhotoID в Excel.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-async def handle_message(
+async def search_part(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    text: str,
 ):
-    text = (update.message.text or "").strip()
+    query_normalized = normalize_part_for_search(
+        text
+    )
 
-    if not text:
-        return
-
-    query_norm = normalize_part_for_search(text)
-
-    if not query_norm:
+    if not query_normalized:
         await update.message.reply_text(
             "❓ Напиши номер детали."
         )
         return
 
     try:
-        df = load_df()
+        dataframe = load_df()
+
     except Exception as error:
         await update.message.reply_text(
             f"⚠️ Ошибка: {error}"
         )
         return
 
-    # Сначала ищем полное совпадение.
-    exact_only = df[df["_pn_norm"] == query_norm]
+    exact_matches = dataframe[
+        dataframe["_pn_norm"] == query_normalized
+    ]
 
-    if not exact_only.empty:
-        if len(exact_only) == 1:
-            row = exact_only.iloc[0]
+    if not exact_matches.empty:
+        if len(exact_matches) == 1:
             await send_part_response(
                 update,
                 context,
-                row,
+                exact_matches.iloc[0],
             )
             return
 
         responses = [
             fmt_row(row)
-            for _, row in exact_only.head(10).iterrows()
+            for _, row in exact_matches.head(10).iterrows()
         ]
 
         message = "\n\n".join(responses)
 
-        if len(exact_only) > 10:
+        if len(exact_matches) > 10:
             message += (
-                "\n\nℹ️ Нашла несколько одинаковых позиций, "
-                "показала первые 10."
+                "\n\nℹ️ Найдено больше 10 позиций. "
+                "Показала первые 10."
             )
 
         await update.message.reply_text(message)
         return
 
-    # Затем ищем по части номера.
-    partial = df[
-        df["_pn_norm"].str.contains(
-            query_norm,
+    partial_matches = dataframe[
+        dataframe["_pn_norm"].str.contains(
+            query_normalized,
             na=False,
             regex=False,
         )
     ]
 
-    if not partial.empty:
-        if len(partial) == 1:
-            row = partial.iloc[0]
+    if not partial_matches.empty:
+        if len(partial_matches) == 1:
             await send_part_response(
                 update,
                 context,
-                row,
+                partial_matches.iloc[0],
             )
             return
 
         responses = [
             fmt_row(row)
-            for _, row in partial.head(10).iterrows()
+            for _, row in partial_matches.head(10).iterrows()
         ]
 
         message = "\n\n".join(responses)
 
-        if len(partial) > 10:
+        if len(partial_matches) > 10:
             message += (
-                "\n\nℹ️ Нашла несколько вариантов, "
-                "показала первые 10."
+                "\n\nℹ️ Найдено больше 10 вариантов. "
+                "Показала первые 10."
             )
 
         await update.message.reply_text(message)
         return
 
-    # Если точного или частичного совпадения нет,
-    # ищем похожие номера.
-    pn_list = (
-        df["_pn_norm"]
+    part_numbers = (
+        dataframe["_pn_norm"]
         .dropna()
         .astype(str)
         .tolist()
     )
 
     close_matches = difflib.get_close_matches(
-        query_norm,
-        pn_list,
+        query_normalized,
+        part_numbers,
         n=10,
         cutoff=0.75,
     )
 
     if close_matches:
-        fuzzy = df[
-            df["_pn_norm"].isin(close_matches)
+        fuzzy_matches = dataframe[
+            dataframe["_pn_norm"].isin(close_matches)
         ]
 
         responses = [
             fmt_row(row)
-            for _, row in fuzzy.head(10).iterrows()
+            for _, row in fuzzy_matches.head(10).iterrows()
         ]
 
         message = (
@@ -999,9 +1216,6 @@ async def handle_message(
             "но нашла похожие:\n\n"
             + "\n\n".join(responses)
         )
-
-        if len(fuzzy) > 10:
-            message += "\n\nℹ️ Показала первые 10."
 
         await update.message.reply_text(message)
         return
@@ -1011,52 +1225,134 @@ async def handle_message(
     )
 
 
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = (
+        update.message.text or ""
+    ).strip()
+
+    if not text:
+        return
+
+    if text == "🔍 Найти запчасть":
+        await begin_search_mode(
+            update,
+            context,
+        )
+        return
+
+    if text == "🗑 Удалить запчасть":
+        await begin_delete_mode(
+            update,
+            context,
+        )
+        return
+
+    if text == "↩️ Отменить удаление":
+        await undo_cmd(
+            update,
+            context,
+        )
+        return
+
+    if text == "❌ Отмена":
+        await cancel_mode(
+            update,
+            context,
+        )
+        return
+
+    current_mode = context.user_data.get("mode")
+
+    if current_mode == "delete":
+        await prepare_delete(
+            update,
+            context,
+            text,
+        )
+        return
+
+    if current_mode == "search":
+        await search_part(
+            update,
+            context,
+            text,
+        )
+        return
+
+    # Если режим не выбран, обычный текст всё равно ищется.
+    await search_part(
+        update,
+        context,
+        text,
+    )
+
+
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "TOKEN не задан. Добавь TOKEN в Railway Variables."
+            "TOKEN не задан. "
+            "Добавь TOKEN в Railway Variables."
         )
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(
-        CommandHandler("start", start)
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
     )
 
-    app.add_handler(
-        CommandHandler("help", help_cmd)
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
-    app.add_handler(
-        CommandHandler("delete", delete_cmd)
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_cmd,
+        )
     )
 
-    app.add_handler(
-        CommandHandler("undo", undo_cmd)
+    application.add_handler(
+        CommandHandler(
+            "delete",
+            delete_cmd,
+        )
     )
 
-    app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "undo",
+            undo_cmd,
+        )
+    )
+
+    application.add_handler(
         CallbackQueryHandler(
             delete_callback,
             pattern=r"^(confirm_delete|cancel_delete)$",
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.Document.ALL,
             handle_document,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.PHOTO,
             handle_photo,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_message,
@@ -1065,7 +1361,7 @@ def main():
 
     print("🤖 Warehouse bot started")
 
-    app.run_polling(
+    application.run_polling(
         drop_pending_updates=True
     )
 

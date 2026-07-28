@@ -23,9 +23,14 @@ from telegram.ext import (
 )
 
 
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
+
 TOKEN = os.getenv("TOKEN")
-FILE_PATH = "warehouse.xlsx"
 ADMIN_ID = os.getenv("ADMIN_ID")
+
+FILE_PATH = "warehouse.xlsx"
 
 REQUIRED_COLUMNS = [
     "PartNumber",
@@ -46,6 +51,10 @@ REQUIRED_COLUMNS = [
 excel_lock = asyncio.Lock()
 
 
+# =========================================================
+# КНОПКИ ГЛАВНОГО МЕНЮ
+# =========================================================
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [
@@ -53,7 +62,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
             "🗑 Удалить запчасть",
         ],
         [
+            "📥 Скачать Excel",
             "↩️ Отменить удаление",
+        ],
+        [
             "❌ Отмена",
         ],
     ],
@@ -62,7 +74,16 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
+
 def is_authorized(user_id: int) -> bool:
+    """
+    Если ADMIN_ID не указан, доступ открыт всем.
+    Если указан — удалять и скачивать Excel может только администратор.
+    """
+
     if not ADMIN_ID:
         return True
 
@@ -70,18 +91,35 @@ def is_authorized(user_id: int) -> bool:
 
 
 def normalize_part_for_search(value) -> str:
+    """
+    Нормализация PartNumber.
+
+    ПУ-11, ПУ 11 и ПУ_11 будут считаться одинаковыми.
+    """
+
     if value is None:
         return ""
 
     value = str(value).strip().upper()
-    value = re.sub(r"[\s\-_./\\]+", "", value)
+
+    value = re.sub(
+        r"[\s\-_./\\]+",
+        "",
+        value,
+    )
 
     return value
 
 
 def safe_str(value) -> str:
-    if pd.isna(value):
+    if value is None:
         return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
 
     return str(value).strip()
 
@@ -122,7 +160,7 @@ def translate_value(value, field):
 def clean_serial(value) -> str:
     serial = safe_str(value)
 
-    if serial in ["/", "-", "—"]:
+    if not serial or serial in ["/", "-", "—"]:
         return "—"
 
     return serial
@@ -134,16 +172,28 @@ def clean_price(value) -> str:
     if not price or price in ["/", "-", "—"]:
         return "—"
 
-    return price.replace("USD", "$").replace("usd", "$").strip()
+    price = price.replace("USD", "$")
+    price = price.replace("usd", "$")
+
+    return price.strip()
 
 
 def clean_date(value) -> str:
-    if pd.isna(value):
+    if value is None:
         return ""
 
     try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    try:
         date_value = pd.to_datetime(value)
-        return date_value.strftime("%Y-%m-%d")
+
+        return date_value.strftime(
+            "%Y-%m-%d"
+        )
 
     except Exception:
         return str(value).split(" ")[0]
@@ -159,11 +209,15 @@ def qty_to_number(value) -> float:
         return 0.0
 
 
+# =========================================================
+# ЧТЕНИЕ EXCEL
+# =========================================================
+
 def load_df() -> pd.DataFrame:
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
             f"Файл {FILE_PATH} не найден. "
-            "Пришли Excel .xlsx файлом в бота."
+            "Отправь Excel .xlsx файлом в бота."
         )
 
     dataframe = pd.read_excel(FILE_PATH)
@@ -191,30 +245,13 @@ def load_df() -> pd.DataFrame:
         .astype(str)
     )
 
-    dataframe["_pn_norm"] = dataframe["PartNumber"].apply(
+    dataframe["_pn_norm"] = dataframe[
+        "PartNumber"
+    ].apply(
         normalize_part_for_search
     )
 
     return dataframe
-
-
-def create_backup(prefix: str = "backup") -> str:
-    if not os.path.exists(FILE_PATH):
-        raise FileNotFoundError(
-            f"Файл {FILE_PATH} не найден."
-        )
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S"
-    )
-
-    backup_path = (
-        f"warehouse_{prefix}_{timestamp}.xlsx"
-    )
-
-    shutil.copy2(FILE_PATH, backup_path)
-
-    return backup_path
 
 
 def get_excel_headers(workbook) -> dict:
@@ -226,21 +263,74 @@ def get_excel_headers(workbook) -> dict:
         start=1,
     ):
         if cell.value is not None:
-            headers[str(cell.value).strip()] = column_number
+            header_name = str(cell.value).strip()
+            headers[header_name] = column_number
 
     return headers
 
 
+# =========================================================
+# РЕЗЕРВНЫЕ КОПИИ
+# =========================================================
+
+def create_backup(prefix: str = "backup") -> str:
+    if not os.path.exists(FILE_PATH):
+        raise FileNotFoundError(
+            f"Файл {FILE_PATH} не найден."
+        )
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d_%H-%M-%S_%f"
+    )
+
+    backup_path = (
+        f"warehouse_{prefix}_{timestamp}.xlsx"
+    )
+
+    shutil.copy2(
+        FILE_PATH,
+        backup_path,
+    )
+
+    return backup_path
+
+
+# =========================================================
+# УДАЛЕНИЕ ПО PARTNUMBER
+# =========================================================
+
 def parse_part_numbers(text: str) -> list[str]:
-    text = text.strip()
+    """
+    Можно писать:
+
+    ПУ-11
+
+    Или:
+
+    ПУ-11, ЭЦН-333М, БПСР4
+
+    Или каждый номер с новой строки.
+    """
+
+    text = safe_str(text)
+
+    text = re.sub(
+        r"^/delete(?:@\w+)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
 
     if not text:
         return []
 
-    parts = re.split(r"[,;\n]+", text)
+    parts = re.split(
+        r"[,;\n]+",
+        text,
+    )
 
-    cleaned_parts = []
-    normalized_seen = set()
+    result = []
+    seen = set()
 
     for part in parts:
         part = part.strip()
@@ -248,18 +338,27 @@ def parse_part_numbers(text: str) -> list[str]:
         if not part:
             continue
 
-        normalized = normalize_part_for_search(part)
+        normalized = normalize_part_for_search(
+            part
+        )
 
-        if normalized and normalized not in normalized_seen:
-            normalized_seen.add(normalized)
-            cleaned_parts.append(part)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(part)
 
-    return cleaned_parts
+    return result
 
 
 def find_rows_by_part_numbers(
     requested_parts: list[str],
 ) -> tuple[list[dict], list[str]]:
+    """
+    Ищет только точное совпадение PartNumber.
+
+    Если один PartNumber встречается в нескольких строках,
+    бот найдёт все такие строки.
+    """
+
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
             f"Файл {FILE_PATH} не найден."
@@ -294,7 +393,10 @@ def find_rows_by_part_numbers(
     found_normalized = set()
     found_rows = []
 
-    for row_number in range(2, worksheet.max_row + 1):
+    for row_number in range(
+        2,
+        worksheet.max_row + 1,
+    ):
         part_value = worksheet.cell(
             row=row_number,
             column=part_column,
@@ -346,10 +448,18 @@ def find_rows_by_part_numbers(
                 "row": row_number,
                 "part_number": safe_str(part_value),
                 "normalized": normalized,
-                "serial_number": safe_str(serial_value),
-                "quantity": safe_str(quantity_value),
-                "shelf": safe_str(shelf_value),
-                "location": safe_str(location_value),
+                "serial_number": safe_str(
+                    serial_value
+                ),
+                "quantity": safe_str(
+                    quantity_value
+                ),
+                "shelf": safe_str(
+                    shelf_value
+                ),
+                "location": safe_str(
+                    location_value
+                ),
             }
         )
 
@@ -367,6 +477,11 @@ def find_rows_by_part_numbers(
 def verify_pending_rows(
     pending_rows: list[dict],
 ) -> bool:
+    """
+    Проверяет, не изменился ли Excel между поиском
+    и нажатием кнопки «Удалить».
+    """
+
     if not os.path.exists(FILE_PATH):
         return False
 
@@ -377,6 +492,7 @@ def verify_pending_rows(
 
     worksheet = workbook.active
     headers = get_excel_headers(workbook)
+
     part_column = headers.get("PartNumber")
 
     if not part_column:
@@ -386,7 +502,10 @@ def verify_pending_rows(
     for item in pending_rows:
         row_number = item["row"]
 
-        if row_number < 2 or row_number > worksheet.max_row:
+        if (
+            row_number < 2
+            or row_number > worksheet.max_row
+        ):
             workbook.close()
             return False
 
@@ -395,11 +514,16 @@ def verify_pending_rows(
             column=part_column,
         ).value
 
-        current_normalized = normalize_part_for_search(
-            current_part
+        current_normalized = (
+            normalize_part_for_search(
+                current_part
+            )
         )
 
-        if current_normalized != item["normalized"]:
+        if (
+            current_normalized
+            != item["normalized"]
+        ):
             workbook.close()
             return False
 
@@ -411,6 +535,13 @@ def verify_pending_rows(
 def delete_excel_rows(
     rows_to_delete: list[dict],
 ) -> list[dict]:
+    """
+    Полностью удаляет строки из Excel.
+
+    Удаление выполняется снизу вверх,
+    чтобы номера строк не смещались.
+    """
+
     if not os.path.exists(FILE_PATH):
         raise FileNotFoundError(
             f"Файл {FILE_PATH} не найден."
@@ -430,11 +561,18 @@ def delete_excel_rows(
     for item in sorted_rows:
         row_number = item["row"]
 
-        if row_number < 2 or row_number > worksheet.max_row:
+        if (
+            row_number < 2
+            or row_number > worksheet.max_row
+        ):
             continue
 
         deleted_items.append(item)
-        worksheet.delete_rows(row_number, 1)
+
+        worksheet.delete_rows(
+            row_number,
+            1,
+        )
 
     workbook.save(FILE_PATH)
     workbook.close()
@@ -492,25 +630,46 @@ def format_delete_preview(
         for part in not_found[:30]:
             lines.append(f"• {part}")
 
+        if len(not_found) > 30:
+            lines.append(
+                f"…и ещё {len(not_found) - 30}."
+            )
+
     lines.append("")
     lines.append(
-        f"Всего строк будет удалено: {len(found_rows)}"
+        f"Всего будет удалено строк: "
+        f"{len(found_rows)}"
     )
 
     lines.append("")
     lines.append(
-        "После удаления запчасти исчезнут "
+        "После удаления эти запчасти исчезнут "
         "из Excel и из поиска бота."
     )
 
     return "\n".join(lines)
 
 
+# =========================================================
+# ФОРМАТ ОТВЕТА ПРИ ПОИСКЕ
+# =========================================================
+
 def fmt_row(row) -> str:
-    part = safe_str(row.get("PartNumber"))
-    quantity = safe_str(row.get("Quantity"))
-    shelf = safe_str(row.get("Shelf"))
-    location = safe_str(row.get("Location"))
+    part = safe_str(
+        row.get("PartNumber")
+    )
+
+    quantity = safe_str(
+        row.get("Quantity")
+    )
+
+    shelf = safe_str(
+        row.get("Shelf")
+    )
+
+    location = safe_str(
+        row.get("Location")
+    )
 
     passport = translate_value(
         row.get("Passport"),
@@ -555,7 +714,8 @@ def fmt_row(row) -> str:
         text = (
             f"❌ ПРОДАНО\n"
             f"📦 {part}\n"
-            f"📍 Полка: {shelf}, ячейка: {location}\n"
+            f"📍 Полка: {shelf}, "
+            f"ячейка: {location}\n"
             f"🔢 Количество: {quantity}\n"
             f"📄 Паспорт: {passport}\n"
             f"🆕 Категория: {category}\n"
@@ -583,7 +743,8 @@ def fmt_row(row) -> str:
 
     return (
         f"✅ {part} есть в наличии\n"
-        f"📦 Полка: {shelf}, ячейка: {location}\n"
+        f"📦 Полка: {shelf}, "
+        f"ячейка: {location}\n"
         f"🔢 Количество: {quantity}\n"
         f"📄 Паспорт: {passport}\n"
         f"🆕 Категория: {category}\n"
@@ -599,27 +760,115 @@ async def send_part_response(
     row,
 ):
     caption = fmt_row(row)
-    photo_id = safe_str(row.get("PhotoID"))
 
-    if photo_id and photo_id.lower() != "nan":
+    photo_id = safe_str(
+        row.get("PhotoID")
+    )
+
+    if (
+        photo_id
+        and photo_id.lower() != "nan"
+    ):
         try:
             await update.message.reply_photo(
                 photo=photo_id,
                 caption=caption,
+                reply_markup=MAIN_KEYBOARD,
             )
             return
 
         except Exception as error:
-            print("PHOTO ERROR:", error)
+            print(
+                "PHOTO ERROR:",
+                error,
+            )
 
-    await update.message.reply_text(caption)
+    await update.message.reply_text(
+        caption,
+        reply_markup=MAIN_KEYBOARD,
+    )
 
+
+# =========================================================
+# ОТПРАВКА АКТУАЛЬНОГО EXCEL
+# =========================================================
+
+async def send_current_excel_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    caption: str,
+):
+    if not os.path.exists(FILE_PATH):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❌ Файл warehouse.xlsx "
+                "не найден."
+            ),
+        )
+        return
+
+    with open(FILE_PATH, "rb") as excel_file:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=excel_file,
+            filename="warehouse_actual.xlsx",
+            caption=caption,
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
+async def download_excel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if (
+        not user
+        or not is_authorized(user.id)
+    ):
+        await update.message.reply_text(
+            "⛔ У вас нет доступа "
+            "к скачиванию базы.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    try:
+        async with excel_lock:
+            await send_current_excel_to_chat(
+                context=context,
+                chat_id=update.effective_chat.id,
+                caption=(
+                    "📥 Актуальный склад.\n\n"
+                    "В этом файле уже нет "
+                    "удалённых запчастей."
+                ),
+            )
+
+    except Exception as error:
+        await update.message.reply_text(
+            "⚠️ Не удалось отправить Excel:\n"
+            f"{error}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
+# =========================================================
+# КОМАНДЫ И КНОПКИ
+# =========================================================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     context.user_data["mode"] = None
+
+    context.user_data.pop(
+        "pending_delete_rows",
+        None,
+    )
 
     await update.message.reply_text(
         "Привет! 👋\n\n"
@@ -634,12 +883,14 @@ async def help_cmd(
 ):
     await update.message.reply_text(
         "🔍 Найти запчасть — поиск по PartNumber.\n\n"
-        "🗑 Удалить запчасть — удалить одну "
-        "или несколько позиций по PartNumber.\n\n"
+        "🗑 Удалить запчасть — удаление "
+        "одной или нескольких позиций.\n\n"
+        "📥 Скачать Excel — получить "
+        "актуальный склад без удалённых позиций.\n\n"
         "↩️ Отменить удаление — восстановить "
-        "последнюю версию Excel.\n\n"
-        "Excel можно обновить, просто отправив "
-        "боту файл .xlsx.",
+        "последнее удаление.\n\n"
+        "Чтобы обновить базу, просто отправь "
+        "боту новый Excel-файл .xlsx.",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -651,7 +902,8 @@ async def begin_search_mode(
     context.user_data["mode"] = "search"
 
     await update.message.reply_text(
-        "🔍 Отправь PartNumber или часть номера.\n\n"
+        "🔍 Отправь PartNumber "
+        "или часть номера.\n\n"
         "Например:\n"
         "ПУ-11",
         reply_markup=MAIN_KEYBOARD,
@@ -664,17 +916,22 @@ async def begin_delete_mode(
 ):
     user = update.effective_user
 
-    if not user or not is_authorized(user.id):
+    if (
+        not user
+        or not is_authorized(user.id)
+    ):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к удалению."
+            "⛔ У вас нет доступа к удалению.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     context.user_data["mode"] = "delete"
 
     await update.message.reply_text(
-        "🗑 Отправь PartNumber, который нужно удалить.\n\n"
-        "Одну позицию:\n"
+        "🗑 Отправь PartNumber, "
+        "который нужно удалить.\n\n"
+        "Одна позиция:\n"
         "ПУ-11\n\n"
         "Несколько позиций:\n"
         "ПУ-11, ЭЦН-333М, БПСР4",
@@ -699,25 +956,33 @@ async def cancel_mode(
     )
 
 
+# =========================================================
+# ПОДГОТОВКА УДАЛЕНИЯ
+# =========================================================
+
 async def prepare_delete(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
 ):
-    requested_parts = parse_part_numbers(text)
+    requested_parts = parse_part_numbers(
+        text
+    )
 
     if not requested_parts:
         await update.message.reply_text(
             "❌ Не удалось прочитать PartNumber.\n\n"
             "Например:\n"
-            "ПУ-11, ЭЦН-333М"
+            "ПУ-11, ЭЦН-333М",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     if len(requested_parts) > 500:
         await update.message.reply_text(
             "❌ За один раз можно указать "
-            "максимум 500 PartNumber."
+            "максимум 500 PartNumber.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -731,7 +996,9 @@ async def prepare_delete(
 
     except Exception as error:
         await update.message.reply_text(
-            f"⚠️ Ошибка при чтении Excel:\n{error}"
+            "⚠️ Ошибка при чтении Excel:\n"
+            f"{error}",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -743,17 +1010,21 @@ async def prepare_delete(
 
         if not_found:
             message += "\n\nНе найдены:\n"
+
             message += "\n".join(
                 f"• {part}"
                 for part in not_found[:30]
             )
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(
+            message,
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
-    context.user_data["pending_delete_rows"] = (
-        found_rows
-    )
+    context.user_data[
+        "pending_delete_rows"
+    ] = found_rows
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -785,9 +1056,13 @@ async def delete_cmd(
 ):
     user = update.effective_user
 
-    if not user or not is_authorized(user.id):
+    if (
+        not user
+        or not is_authorized(user.id)
+    ):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к удалению."
+            "⛔ У вас нет доступа к удалению.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -801,7 +1076,10 @@ async def delete_cmd(
     ).strip()
 
     if not part_text:
-        await begin_delete_mode(update, context)
+        await begin_delete_mode(
+            update,
+            context,
+        )
         return
 
     await prepare_delete(
@@ -810,6 +1088,10 @@ async def delete_cmd(
         part_text,
     )
 
+
+# =========================================================
+# ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
+# =========================================================
 
 async def delete_callback(
     update: Update,
@@ -839,7 +1121,8 @@ async def delete_callback(
         )
 
         await query.edit_message_text(
-            "❌ Удаление отменено. Excel не изменён."
+            "❌ Удаление отменено. "
+            "Excel не изменён."
         )
         return
 
@@ -853,13 +1136,16 @@ async def delete_callback(
     if not pending_rows:
         await query.edit_message_text(
             "⚠️ Список удаления уже недействителен.\n"
-            "Нажми кнопку «🗑 Удалить запчасть» ещё раз."
+            "Нажми кнопку «🗑 Удалить запчасть» "
+            "ещё раз."
         )
         return
 
     try:
         async with excel_lock:
-            if not verify_pending_rows(pending_rows):
+            if not verify_pending_rows(
+                pending_rows
+            ):
                 context.user_data.pop(
                     "pending_delete_rows",
                     None,
@@ -869,7 +1155,9 @@ async def delete_callback(
 
                 await query.edit_message_text(
                     "⚠️ Excel изменился после поиска.\n"
-                    "Для безопасности удаление остановлено."
+                    "Для безопасности удаление "
+                    "остановлено.\n\n"
+                    "Попробуй ещё раз."
                 )
                 return
 
@@ -891,7 +1179,8 @@ async def delete_callback(
 
     except Exception as error:
         await query.edit_message_text(
-            f"⚠️ Ошибка при удалении:\n{error}"
+            "⚠️ Ошибка при удалении:\n"
+            f"{error}"
         )
         return
 
@@ -903,7 +1192,7 @@ async def delete_callback(
     context.user_data["mode"] = None
 
     lines = [
-        f"✅ Полностью удалено строк: "
+        "✅ Полностью удалено строк: "
         f"{len(deleted_items)}",
         "",
     ]
@@ -926,13 +1215,47 @@ async def delete_callback(
 
     lines.append("")
     lines.append(
-        "Эти запчасти больше не находятся через поиск."
+        "Эти запчасти больше не находятся "
+        "через поиск."
+    )
+
+    lines.append("")
+    lines.append(
+        "Сейчас отправляю новый актуальный Excel."
     )
 
     await query.edit_message_text(
         "\n".join(lines)
     )
 
+    try:
+        await send_current_excel_to_chat(
+            context=context,
+            chat_id=query.message.chat_id,
+            caption=(
+                "📥 Обновлённый Excel.\n\n"
+                "Удалённые запчасти уже убраны "
+                "из списка.\n"
+                "Этот файл можно отправлять клиентам."
+            ),
+        )
+
+    except Exception as error:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "⚠️ Запчасти удалены, но не удалось "
+                "отправить Excel:\n"
+                f"{error}\n\n"
+                "Нажми кнопку «📥 Скачать Excel»."
+            ),
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
+# =========================================================
+# ОТМЕНА ПОСЛЕДНЕГО УДАЛЕНИЯ
+# =========================================================
 
 async def undo_cmd(
     update: Update,
@@ -940,18 +1263,26 @@ async def undo_cmd(
 ):
     user = update.effective_user
 
-    if not user or not is_authorized(user.id):
+    if (
+        not user
+        or not is_authorized(user.id)
+    ):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к восстановлению."
+            "⛔ У вас нет доступа "
+            "к восстановлению.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    backup_path = context.application.bot_data.get(
-        "last_backup"
+    backup_path = (
+        context.application.bot_data.get(
+            "last_backup"
+        )
     )
 
-    if not backup_path or not os.path.exists(
-        backup_path
+    if (
+        not backup_path
+        or not os.path.exists(backup_path)
     ):
         await update.message.reply_text(
             "❌ Нет последнего удаления, "
@@ -962,7 +1293,9 @@ async def undo_cmd(
 
     try:
         async with excel_lock:
-            create_backup("before_undo")
+            create_backup(
+                "before_undo"
+            )
 
             shutil.copy2(
                 backup_path,
@@ -981,7 +1314,9 @@ async def undo_cmd(
 
     except Exception as error:
         await update.message.reply_text(
-            f"⚠️ Не удалось восстановить Excel:\n{error}"
+            "⚠️ Не удалось восстановить Excel:\n"
+            f"{error}",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -989,10 +1324,33 @@ async def undo_cmd(
 
     await update.message.reply_text(
         "✅ Последнее удаление отменено.\n"
-        "Предыдущая версия warehouse.xlsx восстановлена.",
+        "Предыдущая версия Excel восстановлена.",
         reply_markup=MAIN_KEYBOARD,
     )
 
+    try:
+        await send_current_excel_to_chat(
+            context=context,
+            chat_id=update.effective_chat.id,
+            caption=(
+                "📥 Восстановленный Excel.\n\n"
+                "Удалённые позиции снова находятся "
+                "в списке."
+            ),
+        )
+
+    except Exception as error:
+        await update.message.reply_text(
+            "⚠️ Excel восстановлен, "
+            "но не удалось отправить файл:\n"
+            f"{error}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
+# =========================================================
+# ЗАГРУЗКА НОВОГО EXCEL В БОТА
+# =========================================================
 
 async def handle_document(
     update: Update,
@@ -1000,9 +1358,14 @@ async def handle_document(
 ):
     user = update.effective_user
 
-    if not user or not is_authorized(user.id):
+    if (
+        not user
+        or not is_authorized(user.id)
+    ):
         await update.message.reply_text(
-            "⛔ У вас нет доступа к обновлению базы."
+            "⛔ У вас нет доступа "
+            "к обновлению базы.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -1013,24 +1376,33 @@ async def handle_document(
 
     file_name = document.file_name or ""
 
-    if not file_name.lower().endswith(".xlsx"):
+    if not file_name.lower().endswith(
+        ".xlsx"
+    ):
         await update.message.reply_text(
-            "❌ Пришли именно Excel файл .xlsx"
+            "❌ Пришли именно Excel-файл .xlsx",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    temp_path = "warehouse_upload_temp.xlsx"
+    temp_path = (
+        "warehouse_upload_temp.xlsx"
+    )
 
     try:
-        telegram_file = await context.bot.get_file(
-            document.file_id
+        telegram_file = (
+            await context.bot.get_file(
+                document.file_id
+            )
         )
 
         await telegram_file.download_to_drive(
             temp_path
         )
 
-        test_dataframe = pd.read_excel(temp_path)
+        test_dataframe = pd.read_excel(
+            temp_path
+        )
 
         test_dataframe.columns = [
             str(column).strip()
@@ -1040,7 +1412,8 @@ async def handle_document(
         missing_columns = [
             column
             for column in REQUIRED_COLUMNS
-            if column not in test_dataframe.columns
+            if column
+            not in test_dataframe.columns
         ]
 
         if missing_columns:
@@ -1049,20 +1422,23 @@ async def handle_document(
 
             await update.message.reply_text(
                 "⚠️ В Excel не хватает колонок:\n"
-                + ", ".join(missing_columns)
+                + ", ".join(missing_columns),
+                reply_markup=MAIN_KEYBOARD,
             )
             return
 
         async with excel_lock:
             if os.path.exists(FILE_PATH):
-                create_backup("before_upload")
+                create_backup(
+                    "before_upload"
+                )
 
             shutil.move(
                 temp_path,
                 FILE_PATH,
             )
 
-        load_df()
+            load_df()
 
     except Exception as error:
         if os.path.exists(temp_path):
@@ -1072,17 +1448,24 @@ async def handle_document(
                 pass
 
         await update.message.reply_text(
-            f"⚠️ Не удалось загрузить Excel:\n{error}"
+            "⚠️ Не удалось загрузить Excel:\n"
+            f"{error}",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     context.user_data["mode"] = None
 
     await update.message.reply_text(
-        "✅ Таблица обновлена! Теперь можно искать.",
+        "✅ Таблица обновлена!\n"
+        "Теперь можно искать и удалять позиции.",
         reply_markup=MAIN_KEYBOARD,
     )
 
+
+# =========================================================
+# ПОЛУЧЕНИЕ PHOTO ID
+# =========================================================
 
 async def handle_photo(
     update: Update,
@@ -1095,24 +1478,29 @@ async def handle_photo(
 
     await update.message.reply_text(
         f"PhotoID:\n{photo.file_id}\n\n"
-        "Скопируй это и вставь "
+        "Скопируй этот PhotoID и вставь "
         "в колонку PhotoID в Excel.",
         reply_markup=MAIN_KEYBOARD,
     )
 
+
+# =========================================================
+# ПОИСК ЗАПЧАСТИ
+# =========================================================
 
 async def search_part(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
 ):
-    query_normalized = normalize_part_for_search(
-        text
+    query_normalized = (
+        normalize_part_for_search(text)
     )
 
     if not query_normalized:
         await update.message.reply_text(
-            "❓ Напиши номер детали."
+            "❓ Напиши номер детали.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -1121,12 +1509,15 @@ async def search_part(
 
     except Exception as error:
         await update.message.reply_text(
-            f"⚠️ Ошибка: {error}"
+            f"⚠️ Ошибка: {error}",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
+    # Точное совпадение.
     exact_matches = dataframe[
-        dataframe["_pn_norm"] == query_normalized
+        dataframe["_pn_norm"]
+        == query_normalized
     ]
 
     if not exact_matches.empty:
@@ -1140,20 +1531,27 @@ async def search_part(
 
         responses = [
             fmt_row(row)
-            for _, row in exact_matches.head(10).iterrows()
+            for _, row
+            in exact_matches.head(10).iterrows()
         ]
 
-        message = "\n\n".join(responses)
+        message = "\n\n".join(
+            responses
+        )
 
         if len(exact_matches) > 10:
             message += (
                 "\n\nℹ️ Найдено больше 10 позиций. "
-                "Показала первые 10."
+                "Показаны первые 10."
             )
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(
+            message,
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
+    # Частичное совпадение.
     partial_matches = dataframe[
         dataframe["_pn_norm"].str.contains(
             query_normalized,
@@ -1173,20 +1571,27 @@ async def search_part(
 
         responses = [
             fmt_row(row)
-            for _, row in partial_matches.head(10).iterrows()
+            for _, row
+            in partial_matches.head(10).iterrows()
         ]
 
-        message = "\n\n".join(responses)
+        message = "\n\n".join(
+            responses
+        )
 
         if len(partial_matches) > 10:
             message += (
                 "\n\nℹ️ Найдено больше 10 вариантов. "
-                "Показала первые 10."
+                "Показаны первые 10."
             )
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(
+            message,
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
+    # Поиск похожих номеров.
     part_numbers = (
         dataframe["_pn_norm"]
         .dropna()
@@ -1203,35 +1608,47 @@ async def search_part(
 
     if close_matches:
         fuzzy_matches = dataframe[
-            dataframe["_pn_norm"].isin(close_matches)
+            dataframe["_pn_norm"].isin(
+                close_matches
+            )
         ]
 
         responses = [
             fmt_row(row)
-            for _, row in fuzzy_matches.head(10).iterrows()
+            for _, row
+            in fuzzy_matches.head(10).iterrows()
         ]
 
         message = (
             "🤔 Точного совпадения нет, "
-            "но нашла похожие:\n\n"
+            "но найдены похожие:\n\n"
             + "\n\n".join(responses)
         )
 
-        await update.message.reply_text(message)
+        await update.message.reply_text(
+            message,
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     await update.message.reply_text(
-        "❓ Ничего не нашла по этому запросу"
+        "❓ Ничего не найдено "
+        "по этому запросу.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
+
+# =========================================================
+# ОБРАБОТКА ОБЫЧНЫХ СООБЩЕНИЙ И КНОПОК
+# =========================================================
 
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    text = (
-        update.message.text or ""
-    ).strip()
+    text = safe_str(
+        update.message.text
+    )
 
     if not text:
         return
@@ -1245,6 +1662,15 @@ async def handle_message(
 
     if text == "🗑 Удалить запчасть":
         await begin_delete_mode(
+            update,
+            context,
+        )
+        return
+
+    if text == "📥 Скачать Excel":
+        context.user_data["mode"] = None
+
+        await download_excel(
             update,
             context,
         )
@@ -1264,7 +1690,9 @@ async def handle_message(
         )
         return
 
-    current_mode = context.user_data.get("mode")
+    current_mode = context.user_data.get(
+        "mode"
+    )
 
     if current_mode == "delete":
         await prepare_delete(
@@ -1282,7 +1710,7 @@ async def handle_message(
         )
         return
 
-    # Если режим не выбран, обычный текст всё равно ищется.
+    # Даже без нажатия кнопки обычный текст ищет запчасть.
     await search_part(
         update,
         context,
@@ -1290,10 +1718,14 @@ async def handle_message(
     )
 
 
+# =========================================================
+# ЗАПУСК БОТА
+# =========================================================
+
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "TOKEN не задан. "
+            "TOKEN не задан.\n"
             "Добавь TOKEN в Railway Variables."
         )
 
@@ -1334,7 +1766,9 @@ def main():
     application.add_handler(
         CallbackQueryHandler(
             delete_callback,
-            pattern=r"^(confirm_delete|cancel_delete)$",
+            pattern=(
+                r"^(confirm_delete|cancel_delete)$"
+            ),
         )
     )
 
@@ -1354,12 +1788,15 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             handle_message,
         )
     )
 
-    print("🤖 Warehouse bot started")
+    print(
+        "🤖 Warehouse bot started"
+    )
 
     application.run_polling(
         drop_pending_updates=True

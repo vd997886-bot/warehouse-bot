@@ -1826,7 +1826,7 @@ if __name__ == "__main__":
     "SoldTo",
     "SoldDate",
     "Notes",
-]
+
 
 excel_lock = asyncio.Lock()
 
